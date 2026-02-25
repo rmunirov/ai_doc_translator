@@ -1,0 +1,43 @@
+[project]
+name = "ai-doc-translator"
+version = "0.1.0"
+description = "AI-agent for translating documents (PDF, TXT, HTML) via a web interface"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "jinja2",
+    "pydantic>=2.0",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg",
+    "alembic",
+    "langchain",
+    "langchain-community",
+    "langgraph",
+    "langchain-gigachat",
+    "pdfplumber",
+    "beautifulsoup4",
+    "python-dotenv",
+    "python-multipart",
+    "httpx",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+    "black",
+    "mypy",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.backends"
