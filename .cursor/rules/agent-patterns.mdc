@@ -1,0 +1,200 @@
+---
+description: AI agent design — BaseAgent class, Pydantic IO, sync/async run/arun
+globs: app/agent/**/*.py
+alwaysApply: false
+---
+
+# AI Agent Patterns
+
+## Concept
+
+An agent is a **self-contained class with AI inside**. It:
+- knows its role via `SYSTEM_PROMPT`
+- accepts a typed task (`<Name>Input`)
+- returns a structured result (`<Name>Output`)
+- supports both sync (`run`) and async (`arun`) invocation
+
+One agent = one responsibility. Complex logic is orchestrated outside by composing multiple agents.
+
+## BaseAgent
+
+All agents inherit from `BaseAgent` defined in `app/agent/base.py`:
+
+```python
+from abc import ABC, abstractmethod
+from langchain_core.language_models import BaseChatModel
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel
+
+
+class BaseAgent(ABC):
+    """Base class for all AI agents in the project."""
+
+    SYSTEM_PROMPT: str  # must be defined as a class constant in every subclass
+
+    def __init__(self, llm: BaseChatModel) -> None:
+        self._llm = llm
+        self._prompt = ChatPromptTemplate.from_messages([
+            ("system", self.SYSTEM_PROMPT),
+            ("human", "{input}"),
+        ])
+
+    @abstractmethod
+    def run(self, data: BaseModel) -> BaseModel:
+        """Synchronous invocation. Use in CLI, scripts, sync tests."""
+
+    @abstractmethod
+    async def arun(self, data: BaseModel) -> BaseModel:
+        """Asynchronous invocation. Use in FastAPI handlers and pipelines."""
+```
+
+## Concrete Agent Structure
+
+Every agent lives in its own file `app/agent/<name>_agent.py`:
+
+```python
+import logging
+from langchain_core.language_models import BaseChatModel
+from app.agent.base import BaseAgent
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+
+# ── Input / Output models ────────────────────────────────────────────────────
+
+class TranslateInput(BaseModel):
+    text: str
+    target_language: str
+    glossary: dict[str, str] = {}
+    context: str = ""
+
+
+class TranslateOutput(BaseModel):
+    translated_text: str
+    source_language: str
+
+
+# ── Agent ────────────────────────────────────────────────────────────────────
+
+class TranslationAgent(BaseAgent):
+    SYSTEM_PROMPT = (
+        "You are a professional translator. "
+        "Translate the given text preserving all formatting. "
+        "Use glossary terms exactly as provided.\n"
+        "Target language: {target_language}.\n"
+        "Glossary: {glossary}\n"
+        "Context from previous chunks: {context}"
+    )
+
+    def __init__(self, llm: BaseChatModel) -> None:
+        super().__init__(llm)
+        self._chain = self._prompt | self._llm.with_structured_output(TranslateOutput)
+
+    def run(self, data: TranslateInput) -> TranslateOutput:
+        try:
+            return self._chain.invoke(data.model_dump())
+        except Exception as exc:
+            logger.error("TranslationAgent.run failed", extra={"input": data.model_dump(), "error": str(exc)})
+            raise
+
+    async def arun(self, data: TranslateInput) -> TranslateOutput:
+        try:
+            return await self._chain.ainvoke(data.model_dump())
+        except Exception as exc:
+            logger.error("TranslationAgent.arun failed", extra={"input": data.model_dump(), "error": str(exc)})
+            raise
+```
+
+## Rules
+
+### Input / Output
+
+- Every agent has its own `<Name>Input` and `<Name>Output` Pydantic models
+- `run()` / `arun()` always return the `Output` model — never a raw string or `dict`
+- Use `.with_structured_output(OutputModel)` so the LLM response is validated automatically
+- Use `Field(default=...)` or `Field(default_factory=...)` for optional fields with mutable defaults
+
+### Sync vs Async
+
+| Method | When to use |
+|---|---|
+| `.run(data)` | CLI scripts, sync tests, non-async contexts |
+| `await .arun(data)` | FastAPI `BackgroundTasks`, async pipelines |
+
+Both methods must always be implemented — never omit one.
+
+### Error Handling
+
+- Never silence exceptions inside an agent
+- Log full context (input + error message) before re-raising
+- The caller (orchestrator, pipeline) decides on retry / fallback logic
+
+### Naming Conventions
+
+| What | Convention | Example |
+|---|---|---|
+| File | `app/agent/<name>_agent.py` | `translation_agent.py` |
+| Class | `<Name>Agent(BaseAgent)` | `TranslationAgent` |
+| Input model | `<Name>Input` | `TranslateInput` |
+| Output model | `<Name>Output` | `TranslateOutput` |
+| System prompt | `SYSTEM_PROMPT` class constant | defined at class level |
+| Dependencies | injected via `__init__` only | `llm`, extra config params |
+
+### What NOT to do
+
+```python
+# ❌ returning a raw string
+def run(self, data: TranslateInput) -> str:
+    return self._llm.invoke(...)
+
+# ❌ global LLM instance
+llm = ChatGigaChat()
+class TranslationAgent(BaseAgent):
+    def run(self, data):
+        return llm.invoke(...)
+
+# ❌ business logic in the prompt builder
+def run(self, data):
+    if len(data.text) > 1000:   # orchestrator's job, not agent's
+        ...
+
+# ❌ silencing exceptions
+async def arun(self, data):
+    try:
+        ...
+    except Exception:
+        return TranslateOutput(translated_text="", source_language="")
+```
+
+## Testing
+
+```python
+from unittest.mock import AsyncMock, MagicMock
+from langchain_core.messages import AIMessage
+import pytest
+
+
+@pytest.fixture
+def mock_llm():
+    llm = MagicMock()
+    llm.with_structured_output.return_value = llm
+    llm.invoke = MagicMock(return_value=TranslateOutput(translated_text="Привет", source_language="en"))
+    llm.ainvoke = AsyncMock(return_value=TranslateOutput(translated_text="Привет", source_language="en"))
+    return llm
+
+
+def test_run(mock_llm):
+    agent = TranslationAgent(llm=mock_llm)
+    result = agent.run(TranslateInput(text="Hello", target_language="ru"))
+    assert isinstance(result, TranslateOutput)
+    assert result.translated_text == "Привет"
+
+
+@pytest.mark.asyncio
+async def test_arun(mock_llm):
+    agent = TranslationAgent(llm=mock_llm)
+    result = await agent.arun(TranslateInput(text="Hello", target_language="ru"))
+    assert isinstance(result, TranslateOutput)
+    assert result.source_language == "en"
+```

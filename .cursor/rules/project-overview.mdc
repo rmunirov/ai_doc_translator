@@ -1,0 +1,88 @@
+---
+description: Project overview — AI document translation agent (stack, architecture, code conventions)
+alwaysApply: true
+---
+
+# AI Doc Translator — Project Overview
+
+## Description
+
+AI-agent for translating documents (PDF, TXT, HTML) from one language to another via a web interface built with FastAPI + Jinja2. The agent supports document chunking, inter-chunk context preservation, formatting preservation, automatic source language detection, user-defined glossaries, translation history, and an asynchronous task queue.
+
+## Tech Stack
+
+- **Language**: Python 3.11+
+- **Package manager**: uv (dependency management, virtual environments, script running)
+- **AI providers**: GigaChat (primary), local models via Ollama / LM Studio
+- **Agent framework**: LangChain + LangGraph (translation pipeline as a graph of nodes)
+- **Web layer**: FastAPI (server + REST API) + Jinja2 (SSR templates), file upload via `multipart/form-data`
+- **Validation**: Pydantic v2
+- **Database**: PostgreSQL — stores translation history, users, glossaries
+- **Document formats**: PDF, TXT, HTML
+
+## Architecture
+
+```
+Browser (Jinja2 UI)
+    │  HTTP upload / status poll
+    ▼
+FastAPI
+    ├── renders Jinja2 templates (GET routes)
+    ├── accepts file upload → enqueues task (POST routes)
+    └── returns result / status (GET routes)
+         │
+         ▼
+   Async Task Queue
+         │
+         ▼
+   LangGraph Agent
+    ├── Language Detection node
+    ├── Document Chunker node
+    ├── Translation node  ←→  GigaChat / Local LLM
+    ├── Context Keeper    ←→  inter-chunk state
+    ├── Glossary lookup   ←→  PostgreSQL
+    └── Document Assembler node (format preserved)
+         │
+         ▼
+   PostgreSQL (history)  +  file storage (result document)
+```
+
+## Key Principles
+
+- **Chunking**: large documents are split into overlapping chunks before translation to fit LLM context windows.
+- **Context preservation**: a summary/glossary of already-translated chunks is passed to each subsequent chunk.
+- **Format preservation**: original document structure (headings, lists, tables) is reconstructed after translation.
+- **Glossary**: per-user term mappings stored in PostgreSQL; injected into every translation prompt.
+- **Async queue**: translation jobs run in the background; the UI polls for status.
+
+## Code Conventions
+
+- **Type hints** are mandatory on all functions and methods.
+- **PEP 8** style; max line length 88 characters (black-compatible).
+- **Docstrings** on every public class and function — Google style.
+- **async/await** for all I/O operations (DB queries, LLM calls, file reads).
+- **Tests**: pytest + pytest-asyncio; cover all agent nodes and API endpoints.
+- **Error handling**: never silence exceptions; log with context and re-raise or return structured error responses.
+- **Secrets**: all credentials (GigaChat API key, DB URL, etc.) via environment variables; use `python-dotenv` locally.
+- **Package management**: use `uv add <pkg>` to add dependencies, `uv run <cmd>` to run scripts; never use `pip install` directly.
+- **README / docs files**: do NOT create or modify any `README.md` or other documentation files unless the user explicitly asks for it.
+
+## Project Structure (target)
+
+```
+ai_doc_translator/
+├── app/
+│   ├── api/            # FastAPI routers
+│   ├── agent/          # LangGraph nodes and graph definition
+│   │   ├── nodes/
+│   │   └── graph.py
+│   ├── services/       # document parsing, chunking, assembling
+│   ├── models/         # Pydantic schemas + SQLAlchemy models
+│   ├── templates/      # Jinja2 HTML templates
+│   ├── static/         # CSS / JS assets
+│   └── main.py         # FastAPI app entry point
+├── tests/
+├── .env.example
+├── pyproject.toml      # uv project config + dependencies
+└── uv.lock
+```

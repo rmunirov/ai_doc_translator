@@ -1,0 +1,213 @@
+---
+description: LangChain tool design — BaseTool, Pydantic args_schema, sync/async, error as text
+globs: app/tools/**/*.py
+alwaysApply: false
+---
+
+# LangChain Tool Patterns
+
+## Concept
+
+A tool is an **action** the LLM can invoke. Unlike an agent (which reasons), a tool simply executes one operation and returns a string result. The LLM reads `description` to decide when and why to call the tool.
+
+**Core rule: a tool never raises an exception.** Errors are returned as plain text so the LLM can retry with adjusted parameters.
+
+## Tool Structure
+
+Every tool lives in `app/tools/<name>_tool.py`:
+
+```python
+import logging
+from langchain_core.tools import BaseTool
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
+
+
+# ── Input schema ─────────────────────────────────────────────────────────────
+
+class TranslateChunkInput(BaseModel):
+    text: str = Field(description="Text chunk to translate, preserving all formatting")
+    target_language: str = Field(description="Target language code, e.g. 'ru', 'en', 'de'")
+    glossary: dict[str, str] = Field(
+        default_factory=dict,
+        description="Optional term mapping: source term → target term. Applied exactly as given.",
+    )
+    context: str = Field(
+        default="",
+        description="Summary of previously translated chunks for context continuity",
+    )
+
+
+# ── Tool ─────────────────────────────────────────────────────────────────────
+
+class TranslateChunkTool(BaseTool):
+    name: str = "translate_chunk"
+    description: str = (
+        "Translates a single text chunk to the target language. "
+        "Use this tool when you need to translate a portion of a document. "
+        "Preserves original formatting (headings, lists, tables). "
+        "Apply glossary terms exactly as provided. "
+        "Returns the translated text as a plain string, "
+        "or a string starting with 'Error:' if translation failed."
+    )
+    args_schema: type[BaseModel] = TranslateChunkInput
+
+    def _run(
+        self,
+        text: str,
+        target_language: str,
+        glossary: dict[str, str] | None = None,
+        context: str = "",
+    ) -> str:
+        try:
+            # implementation here
+            ...
+            return translated_text
+        except Exception as exc:
+            logger.error("TranslateChunkTool._run failed", extra={"error": str(exc)})
+            return f"Error: {exc}"
+
+    async def _arun(
+        self,
+        text: str,
+        target_language: str,
+        glossary: dict[str, str] | None = None,
+        context: str = "",
+    ) -> str:
+        try:
+            # implementation here
+            ...
+            return translated_text
+        except Exception as exc:
+            logger.error("TranslateChunkTool._arun failed", extra={"error": str(exc)})
+            return f"Error: {exc}"
+```
+
+## Rules
+
+### Description
+
+The `description` field is critical — the LLM uses it to decide when to call the tool and how to interpret the result. A good description answers:
+
+1. **What** the tool does
+2. **When** to use it
+3. **What** it returns (including the error format)
+
+```python
+# ✅ Good description
+description: str = (
+    "Detects the language of the given text. "
+    "Use before translation when the source language is unknown. "
+    "Returns an ISO 639-1 language code (e.g. 'en', 'ru', 'de'), "
+    "or a string starting with 'Error:' if detection failed."
+)
+
+# ❌ Bad description — too vague, LLM won't know when to use it
+description: str = "Detects language."
+```
+
+### Args Schema
+
+Every argument in `args_schema` must have a `Field(description=...)` — the LLM uses these descriptions to fill in the arguments correctly.
+
+```python
+class DetectLanguageInput(BaseModel):
+    text: str = Field(
+        description="Text sample to detect the language from. At least 20 characters recommended."
+    )
+    # ❌ Missing Field description — LLM has no guidance
+    # text: str
+```
+
+### Error Handling
+
+Never raise exceptions inside `_run` / `_arun`. Catch everything and return the error as a string prefixed with `"Error: "` so the LLM can recognize and handle it.
+
+```python
+# ✅ Correct
+def _run(self, text: str, ...) -> str:
+    try:
+        return self._do_work(text)
+    except Exception as exc:
+        logger.error("ToolName._run failed", extra={"error": str(exc)})
+        return f"Error: {exc}"
+
+# ❌ Wrong — exception will crash the agent
+def _run(self, text: str, ...) -> str:
+    return self._do_work(text)  # may raise
+```
+
+### Sync and Async
+
+Both `_run` and `_arun` must always be implemented. Never leave one as `NotImplementedError`.
+
+```python
+# ✅ Both implemented
+def _run(self, ...) -> str: ...
+async def _arun(self, ...) -> str: ...
+
+# ❌ Missing async implementation
+async def _arun(self, ...) -> str:
+    raise NotImplementedError
+```
+
+### Naming Conventions
+
+| What | Convention | Example |
+|---|---|---|
+| File | `app/tools/<name>_tool.py` | `translate_chunk_tool.py` |
+| Class | `<Name>Tool(BaseTool)` | `TranslateChunkTool` |
+| Input schema | `<Name>Input(BaseModel)` | `TranslateChunkInput` |
+| `name` field | snake_case, short | `"translate_chunk"` |
+| `description` | multiline string, describes what/when/returns | see examples above |
+
+### What NOT to do
+
+```python
+# ❌ No args_schema — LLM can't validate or understand arguments
+class BadTool(BaseTool):
+    name = "bad_tool"
+    description = "Does something"
+    def _run(self, text: str) -> str: ...
+
+# ❌ Raising instead of returning error
+def _run(self, text: str, ...) -> str:
+    if not text:
+        raise ValueError("text is empty")  # crashes the agent
+
+# ❌ Vague description without return format
+description = "Translates text."
+
+# ❌ Mutable default in Field
+glossary: dict = Field(default={})        # wrong
+glossary: dict = Field(default_factory=dict)  # correct
+```
+
+## Testing
+
+```python
+import pytest
+
+
+def test_run_success():
+    tool = TranslateChunkTool()
+    result = tool._run(text="Hello world", target_language="ru")
+    assert isinstance(result, str)
+    assert not result.startswith("Error:")
+
+
+def test_run_returns_error_string_on_failure(monkeypatch):
+    tool = TranslateChunkTool()
+    monkeypatch.setattr(tool, "_do_work", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("LLM unavailable")))
+    result = tool._run(text="Hello", target_language="ru")
+    assert result.startswith("Error:")
+
+
+@pytest.mark.asyncio
+async def test_arun_success():
+    tool = TranslateChunkTool()
+    result = await tool._arun(text="Hello world", target_language="ru")
+    assert isinstance(result, str)
+    assert not result.startswith("Error:")
+```
