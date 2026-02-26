@@ -1,0 +1,124 @@
+"""Pydantic v2 schemas for internal data structures and API request/response."""
+
+import enum
+import uuid
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel
+
+
+# ---------------------------------------------------------------------------
+# Internal document models (not stored in DB)
+# ---------------------------------------------------------------------------
+
+
+class BlockType(str, enum.Enum):
+    """Semantic type of a document block."""
+
+    HEADING = "heading"
+    PARAGRAPH = "paragraph"
+    TABLE = "table"
+    LIST_ITEM = "list_item"
+    CODE = "code"
+
+
+class Block(BaseModel):
+    """Single structural element extracted from a document."""
+
+    type: BlockType
+    text: str
+    level: int = 0
+    bbox: tuple[float, float, float, float] | None = None
+    font_size: float | None = None
+    is_bold: bool = False
+    raw_html: str | None = None
+
+
+class ParsedDocument(BaseModel):
+    """Result of parsing an uploaded file into structured blocks."""
+
+    format: Literal["pdf", "html", "txt"]
+    blocks: list[Block]
+    metadata: dict[str, Any] = {}
+
+
+class Chunk(BaseModel):
+    """A segment of blocks sized to fit an LLM context window."""
+
+    index: int
+    blocks: list[Block]
+    text: str
+    overlap_prev: str = ""
+
+
+# ---------------------------------------------------------------------------
+# API request / response schemas
+# ---------------------------------------------------------------------------
+
+
+class UploadResponse(BaseModel):
+    """Returned after a file is uploaded and a job is enqueued."""
+
+    job_id: uuid.UUID
+    status: str
+
+
+class JobStatusResponse(BaseModel):
+    """Current state of a translation job."""
+
+    job_id: uuid.UUID
+    status: str
+    source_lang: str | None = None
+    target_lang: str
+    chunk_done: int = 0
+    chunk_total: int | None = None
+    error_msg: str | None = None
+
+
+class CancelResponse(BaseModel):
+    """Returned when a job is successfully cancelled."""
+
+    status: str
+
+
+class GlossaryEntryCreate(BaseModel):
+    """Body for creating a new glossary entry."""
+
+    user_id: uuid.UUID
+    source_term: str
+    target_term: str
+
+
+class GlossaryEntryUpdate(BaseModel):
+    """Body for updating an existing glossary entry."""
+
+    source_term: str
+    target_term: str
+
+
+class GlossaryEntryResponse(BaseModel):
+    """Single glossary entry returned by the API."""
+
+    id: uuid.UUID
+    user_id: uuid.UUID
+    source_term: str
+    target_term: str
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class HistoryItemResponse(BaseModel):
+    """Single history record returned by the API."""
+
+    id: uuid.UUID
+    job_id: uuid.UUID
+    user_id: uuid.UUID
+    filename: str
+    source_lang: str | None = None
+    target_lang: str | None = None
+    char_count: int | None = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

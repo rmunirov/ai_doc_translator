@@ -20,6 +20,9 @@ dependencies = [
     "python-dotenv",
     "python-multipart",
     "httpx",
+    "reportlab>=4.4.10",
+    "langdetect>=1.0.9",
+    "aiofiles>=25.1.0",
 ]
 
 [dependency-groups]
@@ -38,6 +41,9 @@ warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
 
+[tool.hatch.build.targets.wheel]
+packages = ["app"]
+
 [build-system]
 requires = ["hatchling"]
-build-backend = "hatchling.backends"
+build-backend = "hatchling.build"
