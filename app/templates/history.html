@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}История переводов — AI Doc Translator{% endblock %}
+
+{% block content %}
+<div class="page-history">
+  <h1 class="page-title">История переводов</h1>
+
+  <div id="history-loading" class="loading-msg">Загрузка…</div>
+  <p id="history-empty" class="empty-msg hidden">Переводов пока нет.</p>
+  <p id="history-error" class="error-msg hidden"></p>
+
+  <div class="table-wrap">
+    <table id="history-table" class="data-table hidden">
+      <thead>
+        <tr>
+          <th>Файл</th>
+          <th>Язык</th>
+          <th>Дата</th>
+          <th>Статус</th>
+          <th>Действия</th>
+        </tr>
+      </thead>
+      <tbody id="history-body"></tbody>
+    </table>
+  </div>
+
+  <div id="history-pagination" class="pagination hidden">
+    <button id="history-prev" class="btn btn-ghost btn-sm" type="button" disabled>← Назад</button>
+    <span id="history-page-info" class="pagination-info"></span>
+    <button id="history-next" class="btn btn-ghost btn-sm" type="button">Вперёд →</button>
+  </div>
+</div>
+{% endblock %}

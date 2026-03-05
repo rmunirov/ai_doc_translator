@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}AI Doc Translator{% endblock %}</title>
+  <link rel="stylesheet" href="/static/css/main.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="container header-inner">
+      <span class="logo">AI Doc Translator</span>
+      <nav class="nav">
+        <a class="nav-link {% if request.url.path == '/' %}active{% endif %}" href="/">Перевод</a>
+        <a class="nav-link {% if request.url.path == '/history' %}active{% endif %}" href="/history">История</a>
+        <a class="nav-link {% if request.url.path == '/glossary' %}active{% endif %}" href="/glossary">Глоссарий</a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <script src="/static/js/app.js"></script>
+</body>
+</html>

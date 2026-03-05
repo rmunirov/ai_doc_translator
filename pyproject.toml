@@ -15,7 +15,6 @@ dependencies = [
     "langchain-community",
     "langgraph",
     "langchain-gigachat",
-    "pdfplumber",
     "beautifulsoup4",
     "python-dotenv",
     "python-multipart",
@@ -23,16 +22,23 @@ dependencies = [
     "reportlab>=4.4.10",
     "langdetect>=1.0.9",
     "aiofiles>=25.1.0",
+    "langchain-openai>=0.3.35",
+    "pymupdf>=1.27.1",
 ]
 
 [dependency-groups]
 dev = [
     "pytest",
     "pytest-asyncio",
+    "aiosqlite",
     "ruff",
     "black",
     "mypy",
+    "types-aiofiles>=25.1.0.20251011",
 ]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
 
 [tool.mypy]
 python_version = "3.11"
@@ -40,6 +46,39 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+# Performance: check only app package, skip venv/cache
+packages = ["app"]
+exclude_gitignore = true
+
+[[tool.mypy.overrides]]
+module = "langdetect"
+ignore_missing_imports = true
+
+# langchain_core.tools @tool has no type stubs; disable untyped-decorator for tools module
+[[tool.mypy.overrides]]
+module = "app.agent.tools"
+disable_error_code = ["untyped-decorator"]
+
+# Skip type-checking heavy third-party libs (treated as Any)
+[[tool.mypy.overrides]]
+module = [
+    "langchain",
+    "langchain.*",
+    "langchain_core",
+    "langchain_core.*",
+    "langchain_openai",
+    "langchain_openai.*",
+    "langchain_gigachat",
+    "langchain_gigachat.*",
+    "langgraph",
+    "langgraph.*",
+    "reportlab",
+    "reportlab.*",
+    "pymupdf",
+    "pymupdf.*",
+]
+follow_imports = "skip"
+ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

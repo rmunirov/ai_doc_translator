@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}Глоссарий — AI Doc Translator{% endblock %}
+
+{% block content %}
+<div class="page-glossary">
+  <h1 class="page-title">Глоссарий</h1>
+
+  <div id="glossary-loading" class="loading-msg">Загрузка…</div>
+  <p id="glossary-error" class="error-msg hidden"></p>
+
+  <div class="table-wrap">
+    <table id="glossary-table" class="data-table hidden">
+      <thead>
+        <tr>
+          <th>Оригинал</th>
+          <th>Перевод</th>
+          <th class="col-actions">Действия</th>
+        </tr>
+      </thead>
+      <tbody id="glossary-body"></tbody>
+    </table>
+  </div>
+
+  <p id="glossary-empty" class="empty-msg hidden">Глоссарий пуст. Добавьте первый термин ниже.</p>
+
+  <!-- Add term form -->
+  <div class="card add-term-card">
+    <h2 class="card-title">Добавить термин</h2>
+    <form id="add-term-form" class="add-term-form" novalidate>
+      <div class="field">
+        <label class="field-label" for="new-source">Оригинал</label>
+        <input id="new-source" class="input" type="text" placeholder="Исходный термин" required />
+      </div>
+      <div class="field">
+        <label class="field-label" for="new-target">Перевод</label>
+        <input id="new-target" class="input" type="text" placeholder="Переведённый термин" required />
+      </div>
+      <button class="btn btn-primary" type="submit">Добавить</button>
+    </form>
+    <p id="add-term-error" class="error-msg hidden"></p>
+  </div>
+</div>
+{% endblock %}

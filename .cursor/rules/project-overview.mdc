@@ -58,6 +58,7 @@ FastAPI
 ## Code Conventions
 
 - **Type hints** are mandatory on all functions and methods.
+- **No `# type: ignore[untyped-decorator]`** — do not suppress untyped-decorator inline. For third-party decorators without type stubs (e.g. `@tool` from langchain), use mypy module overrides in `pyproject.toml` (`disable_error_code = ["untyped-decorator"]`) or switch to a typed alternative (e.g. `BaseTool` instead of `@tool`).
 - **PEP 8** style; max line length 88 characters (black-compatible).
 - **Docstrings** on every public class and function — Google style.
 - **async/await** for all I/O operations (DB queries, LLM calls, file reads).

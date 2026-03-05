@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}Перевод документов — AI Doc Translator{% endblock %}
+
+{% block content %}
+<div class="page-index">
+  <h1 class="page-title">Перевод документов</h1>
+
+  <!-- Upload form (State A) -->
+  <div id="upload-section" class="card">
+    <div id="dropzone" class="dropzone" role="button" tabindex="0" aria-label="Зона загрузки файла">
+      <div class="dropzone-icon" aria-hidden="true">📄</div>
+      <p class="dropzone-hint">Перетащите файл или <label class="link" for="file-input">выберите</label></p>
+      <p class="dropzone-formats">PDF, TXT, HTML · до 50 МБ</p>
+      <input id="file-input" type="file" accept=".pdf,.txt,.html" class="visually-hidden" />
+    </div>
+
+    <div id="file-chosen" class="file-chosen hidden">
+      <span id="file-name" class="file-name"></span>
+      <button id="file-clear" class="btn btn-ghost btn-sm" type="button" aria-label="Убрать файл">✕</button>
+    </div>
+
+    <div class="upload-controls">
+      <div class="field">
+        <label class="field-label" for="target-lang">Язык перевода</label>
+        <select id="target-lang" class="select">
+          <option value="ru">Русский</option>
+          <option value="en">English</option>
+          <option value="de">Deutsch</option>
+          <option value="fr">Français</option>
+          <option value="es">Español</option>
+          <option value="it">Italiano</option>
+          <option value="pt">Português</option>
+          <option value="pl">Polski</option>
+          <option value="nl">Nederlands</option>
+          <option value="tr">Türkçe</option>
+          <option value="ar">العربية</option>
+          <option value="zh">中文</option>
+          <option value="ja">日本語</option>
+          <option value="ko">한국어</option>
+          <option value="uk">Українська</option>
+          <option value="be">Беларуская</option>
+          <option value="cs">Čeština</option>
+          <option value="sk">Slovenčina</option>
+          <option value="ro">Română</option>
+          <option value="hu">Magyar</option>
+        </select>
+      </div>
+      <button id="upload-btn" class="btn btn-primary" type="button" disabled>Перевести</button>
+    </div>
+
+    <p id="upload-error" class="error-msg hidden"></p>
+  </div>
+
+  <!-- Progress card (State B) -->
+  <div id="progress-section" class="card hidden">
+    <div class="progress-header">
+      <h2 class="progress-title">Перевод</h2>
+      <span id="job-status-badge" class="status-badge"></span>
+    </div>
+
+    <p id="progress-phase" class="progress-phase"></p>
+
+    <div class="progress-bar-wrap" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progress-bar-wrap">
+      <div id="progress-bar" class="progress-bar"></div>
+    </div>
+    <p id="progress-label" class="progress-label"></p>
+
+    <div class="progress-actions">
+      <a id="download-btn" class="btn btn-primary hidden" href="#" download>Скачать</a>
+      <button id="cancel-btn" class="btn btn-danger hidden" type="button">Отменить</button>
+      <button id="new-translation-btn" class="btn btn-ghost hidden" type="button">Новый перевод</button>
+    </div>
+
+    <p id="progress-error" class="error-msg hidden"></p>
+  </div>
+</div>
+{% endblock %}

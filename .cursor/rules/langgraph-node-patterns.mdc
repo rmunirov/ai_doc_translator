@@ -1,0 +1,265 @@
+---
+description: LangGraph node design — node vs agent distinction, function nodes, agent-delegating nodes, graph state
+globs: app/agent/nodes/**/*.py, app/agent/graph.py
+alwaysApply: false
+---
+
+# LangGraph Node Patterns
+
+## Concept: Node ≠ Agent
+
+| Object | Definition | Uses LLM | Has prompt, tools, role |
+|--------|-----------|----------|------------------------|
+| **Node** | A step in the LangGraph graph. Function `(state) -> state_update` | not necessarily | no |
+| **Agent** | A self-contained class from `agent-patterns.mdc` | always | yes |
+
+A node is a vertex of the graph. An agent is an LLM wrapper with a role. A node **may call** an agent, or it may contain pure logic with no LLM involvement at all.
+
+## Two Types of Nodes
+
+### Function Node (no LLM)
+
+Pure logic: parsing, chunking, assembling, DB reads, glossary lookups — anything that does not require LLM reasoning.
+
+```python
+import logging
+from typing import Any
+
+from app.agent.state import GraphState
+from app.services.chunker import create_overlapping_chunks
+
+logger = logging.getLogger(__name__)
+
+
+def chunk_document_node(state: GraphState) -> dict[str, Any]:
+    """Split document text into overlapping chunks."""
+    chunks = create_overlapping_chunks(
+        text=state.document_text,
+        chunk_size=state.chunk_size,
+        overlap=state.chunk_overlap,
+    )
+    logger.info("Chunked document into %d parts", len(chunks))
+    return {"chunks": chunks, "current_chunk_index": 0}
+```
+
+### Agent-Delegating Node (uses LLM via an Agent)
+
+Prepares `Input` from state, calls `agent.arun()`, converts `Output` back to a state update.
+
+```python
+import logging
+from typing import Any
+
+from app.agent.state import GraphState
+from app.agent.translation_agent import TranslationAgent, TranslateInput
+
+logger = logging.getLogger(__name__)
+
+
+async def translate_chunk_node(state: GraphState) -> dict[str, Any]:
+    """Translate the current chunk using TranslationAgent."""
+    agent = TranslationAgent(llm=state.llm)
+    result = await agent.arun(TranslateInput(
+        text=state.chunks[state.current_chunk_index],
+        target_language=state.target_language,
+        glossary=state.glossary,
+        context=state.context_summary,
+    ))
+    translated = list(state.translated_chunks)
+    translated.append(result.translated_text)
+    return {
+        "translated_chunks": translated,
+        "detected_source_language": result.source_language,
+    }
+```
+
+The node is a **thin wrapper**: state → Input, `agent.arun()` → Output, Output → state update. Business logic (retry, fallback) belongs to the graph or an orchestrator — not to the node.
+
+## Node Signature
+
+Sync:
+```python
+def node_name(state: GraphState) -> dict[str, Any]:
+    ...
+```
+
+Async (required when calling agents or doing I/O):
+```python
+async def node_name(state: GraphState) -> dict[str, Any]:
+    ...
+```
+
+Rules:
+- First argument is always `state: GraphState`
+- Returns a `dict` with fields to merge into the state — **never mutate `state` directly**
+- A node must update only the fields it owns; avoid overwriting unrelated keys
+
+## Graph State
+
+Define a single `GraphState` per graph in `app/agent/state.py`:
+
+```python
+from typing import Any
+
+from langchain_core.language_models import BaseChatModel
+from pydantic import BaseModel, Field
+
+
+class GraphState(BaseModel):
+    """Shared state for the translation graph."""
+
+    model_config = {"arbitrary_types_allowed": True}
+
+    # ── Inputs (set before graph starts) ──────────────────────────
+    document_text: str = ""
+    target_language: str = ""
+    chunk_size: int = 2000
+    chunk_overlap: int = 200
+    glossary: dict[str, str] = Field(default_factory=dict)
+    llm: BaseChatModel | None = None
+
+    # ── Intermediate (filled by nodes) ────────────────────────────
+    detected_language: str = ""
+    chunks: list[str] = Field(default_factory=list)
+    current_chunk_index: int = 0
+    context_summary: str = ""
+    translated_chunks: list[str] = Field(default_factory=list)
+
+    # ── Output ────────────────────────────────────────────────────
+    result_text: str = ""
+    error: str | None = None
+```
+
+All fields have defaults so nodes can return partial updates. For fields that accumulate values from parallel nodes, use `Annotated` with a reducer:
+
+```python
+from typing import Annotated
+
+from pydantic import BaseModel, Field
+
+
+class GraphState(BaseModel):
+    translated_chunks: Annotated[list[str], lambda a, b: a + b] = Field(default_factory=list)
+```
+
+## Graph Assembly
+
+Assemble the graph in `app/agent/graph.py`:
+
+```python
+from langgraph.graph import StateGraph, END
+
+from app.agent.state import GraphState
+from app.agent.nodes.detect_language_node import detect_language_node
+from app.agent.nodes.chunk_document_node import chunk_document_node
+from app.agent.nodes.translate_chunk_node import translate_chunk_node
+from app.agent.nodes.update_context_node import update_context_node
+from app.agent.nodes.assemble_document_node import assemble_document_node
+
+
+def build_translation_graph() -> StateGraph:
+    """Build and return the compiled translation graph."""
+    graph = StateGraph(GraphState)
+
+    graph.add_node("detect_language", detect_language_node)
+    graph.add_node("chunk_document", chunk_document_node)
+    graph.add_node("translate_chunk", translate_chunk_node)
+    graph.add_node("update_context", update_context_node)
+    graph.add_node("assemble_document", assemble_document_node)
+
+    graph.set_entry_point("detect_language")
+    graph.add_edge("detect_language", "chunk_document")
+    graph.add_edge("chunk_document", "translate_chunk")
+    graph.add_edge("translate_chunk", "update_context")
+    graph.add_conditional_edges(
+        "update_context",
+        lambda s: "translate_chunk" if s.current_chunk_index < len(s.chunks) else "assemble_document",
+    )
+    graph.add_edge("assemble_document", END)
+
+    return graph.compile()
+```
+
+## Naming Conventions
+
+| What | Convention | Example |
+|------|-----------|---------|
+| Node file | `app/agent/nodes/<name>_node.py` | `translate_chunk_node.py` |
+| Node function | `<name>_node(state) -> dict` | `translate_chunk_node` |
+| State file | `app/agent/state.py` | single file per graph |
+| Graph file | `app/agent/graph.py` | `build_translation_graph()` |
+
+## Relationship with Agent Patterns
+
+- **Agents** are defined in `app/agent/<name>_agent.py` per `agent-patterns.mdc`
+- **Nodes** live in `app/agent/nodes/` and import agents when needed
+- One agent can be reused across multiple nodes and graphs
+- Nodes that don't need LLM should **not** import or instantiate agents
+
+## Error Handling
+
+- **Function nodes**: raise exceptions — the graph runner handles errors
+- **Agent-delegating nodes**: the agent raises (per `agent-patterns.mdc`); the node lets it propagate
+- Log context before the exception leaves the node
+
+```python
+async def translate_chunk_node(state: GraphState) -> dict[str, Any]:
+    try:
+        ...
+    except Exception as exc:
+        logger.error("translate_chunk_node failed", extra={"chunk_index": state.current_chunk_index, "error": str(exc)})
+        raise
+```
+
+## What NOT to Do
+
+```python
+# ❌ Putting LLM call directly in a node — use an Agent
+async def translate_chunk_node(state: GraphState) -> dict[str, Any]:
+    llm = state.llm
+    result = await llm.ainvoke(state.chunks[0])  # no prompt, no structure
+    return {"translated_chunks": [result.content]}
+
+# ❌ Mutating state in place
+def chunk_document_node(state: GraphState) -> dict[str, Any]:
+    state.chunks = split(state.document_text)  # wrong — mutates state
+    return state.model_dump()
+
+# ❌ Business logic inside an agent-delegating node
+async def translate_chunk_node(state: GraphState) -> dict[str, Any]:
+    if len(state.chunks[0]) > 5000:
+        # splitting logic belongs in a separate function node
+        ...
+
+# ❌ Creating an agent at module level
+agent = TranslationAgent(llm=some_global_llm)
+async def translate_chunk_node(state: GraphState) -> dict[str, Any]:
+    return await agent.arun(...)  # not injectable, not testable
+```
+
+## Testing
+
+```python
+import pytest
+
+
+def test_chunk_document_node():
+    state = GraphState(document_text="Hello world. " * 100, chunk_size=500, chunk_overlap=50)
+    result = chunk_document_node(state)
+    assert "chunks" in result
+    assert len(result["chunks"]) > 0
+    assert "current_chunk_index" in result
+
+
+@pytest.mark.asyncio
+async def test_translate_chunk_node(mock_llm):
+    state = GraphState(
+        llm=mock_llm,
+        chunks=["Hello world"],
+        current_chunk_index=0,
+        target_language="ru",
+    )
+    result = await translate_chunk_node(state)
+    assert "translated_chunks" in result
+    assert len(result["translated_chunks"]) == 1
+```

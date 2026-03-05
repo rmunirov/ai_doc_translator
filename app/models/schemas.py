@@ -31,8 +31,10 @@ class Block(BaseModel):
     level: int = 0
     bbox: tuple[float, float, float, float] | None = None
     font_size: float | None = None
+    font_color: str | None = None  # hex "#RRGGBB"
     is_bold: bool = False
     raw_html: str | None = None
+    page_index: int | None = None
 
 
 class ParsedDocument(BaseModel):
