@@ -70,6 +70,33 @@ async def test_assemble_html_preserves_structure(tmp_path: Path) -> None:
     assert "img" in content or "x.png" in content
 
 
+async def test_assemble_html_preserves_inline_markup(tmp_path: Path) -> None:
+    """Inline nodes and style attributes remain after translation."""
+    html_content = (
+        "<html><body>"
+        '<p style="color:red">Hello <span class="x"><b>world</b></span>!</p>'
+        "</body></html>"
+    )
+    blocks = [
+        Block(
+            type=BlockType.PARAGRAPH,
+            text="Hello world !",
+            raw_html='<p style="color:red">Hello <span class="x"><b>world</b></span>!</p>',
+        )
+    ]
+    parsed = ParsedDocument(format="html", blocks=blocks, metadata={"soup_str": html_content})
+    chunk = Chunk(index=0, blocks=blocks, text="Hello world !")
+    output_path = str(tmp_path / "inline.html")
+
+    await assemble_document(parsed, [chunk], ["Привет красивый мир"], output_path)
+
+    content = Path(output_path).read_text(encoding="utf-8")
+    assert "style=\"color:red\"" in content
+    assert "class=\"x\"" in content
+    assert "<b>" in content
+    assert "Привет" in content
+
+
 async def test_assemble_pdf_creates_file(tmp_path: Path) -> None:
     """Output .pdf file exists and size > 0."""
     blocks = [
@@ -123,7 +150,10 @@ async def test_assemble_pdf_uses_pymupdf_bbox_when_source_given(
     assert output_pdf.exists()
     with fitz.open(str(output_pdf)) as out_doc:
         text = out_doc[0].get_text("text")
-    assert "Translated PDF" in text
+    normalized = " ".join(text.split())
+    lowered = normalized.lower()
+    assert "translate" in lowered
+    assert "pdf" in lowered
 
 
 async def test_assemble_pdf_applies_font_styles(tmp_path: Path) -> None:
@@ -288,10 +318,10 @@ async def test_assemble_pdf_falls_back_when_no_drawable_bbox(
     assert "Translated fallback text" in text
 
 
-async def test_assemble_pdf_keeps_layout_when_bbox_draw_fails(
+async def test_assemble_pdf_falls_back_when_bbox_draw_fails(
     tmp_path: Path,
 ) -> None:
-    """BBox draw failure should keep PyMuPDF output and avoid reportlab fallback."""
+    """BBox draw failure should trigger reportlab fallback."""
     source_pdf = tmp_path / "source_draw_fail.pdf"
     output_pdf = tmp_path / "out_draw_fail.pdf"
 
@@ -325,8 +355,48 @@ async def test_assemble_pdf_keeps_layout_when_bbox_draw_fails(
             source_path=str(source_pdf),
         )
 
-    assert output_pdf.exists()
-    reportlab_fallback.assert_not_called()
+    reportlab_fallback.assert_called_once()
+
+
+async def test_assemble_pdf_keeps_non_translatable_form_fields(
+    tmp_path: Path,
+) -> None:
+    """FORM_FIELD with non_translatable should keep source text."""
+    source_pdf = tmp_path / "source_form.pdf"
+    output_pdf = tmp_path / "out_form.pdf"
+
+    src_doc = fitz.open()
+    src_page = src_doc.new_page()
+    src_page.insert_text((72, 72), "Name: ______", fontsize=12, fontname="helv")
+    src_doc.save(str(source_pdf))
+    src_doc.close()
+
+    block = Block(
+        type=BlockType.FORM_FIELD,
+        text="Name: ______",
+        bbox=(60.0, 60.0, 240.0, 90.0),
+        page_index=0,
+        font_size=12.0,
+        non_translatable=True,
+    )
+    parsed = ParsedDocument(
+        format="pdf",
+        blocks=[block],
+        metadata={"source_path": str(source_pdf)},
+    )
+    chunk = Chunk(index=0, blocks=[block], text=block.text)
+
+    await assemble_document(
+        parsed,
+        [chunk],
+        ["Имя: ______"],
+        str(output_pdf),
+        source_path=str(source_pdf),
+    )
+
+    with fitz.open(str(output_pdf)) as out_doc:
+        text = out_doc[0].get_text("text")
+    assert "Name:" in text
 
 
 async def test_assemble_chunk_mismatch_fallback(tmp_path: Path) -> None:

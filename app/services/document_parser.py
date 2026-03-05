@@ -9,7 +9,7 @@ from typing import Any
 
 import aiofiles
 import pymupdf
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from app.models.schemas import Block, BlockType, ParsedDocument
 
@@ -26,7 +26,7 @@ _HEADING_TAG_LEVELS: dict[str, int] = {
 
 _HTML_TAGS_OF_INTEREST = [
     "h1", "h2", "h3", "h4", "h5", "h6",
-    "p", "li", "table",
+    "p", "li", "table", "caption",
 ]
 
 # PyMuPDF span flags: bold = 2^4
@@ -83,6 +83,11 @@ def _starts_new_paragraph(text: str) -> bool:
     return first.isupper() or first.isdigit()
 
 
+_LIST_BULLET_RE = re.compile(r"^\s*(?:[-*•]|(?:\d+[\).\]])|(?:[A-Za-z][\).\]]))\s+")
+_CAPTION_RE = re.compile(r"^\s*(?:figure|fig\.|table|табл\.|рис\.)\s*\d*", re.IGNORECASE)
+_FORM_FIELD_RE = re.compile(r"^\s*[^\n:]{1,40}\s*:\s*(?:_+|\.{2,}|\S.*)$")
+
+
 def _bboxes_overlap(
     bbox1: tuple[float, float, float, float],
     bbox2: tuple[float, float, float, float],
@@ -119,6 +124,17 @@ def _merge_bbox(
 def _color_to_hex(color: int) -> str:
     """Convert PyMuPDF color int to hex #RRGGBB."""
     return f"#{color & 0xFFFFFF:06x}"
+
+
+def _extract_tag_text_nodes(tag: Tag) -> list[str]:
+    """Extract non-empty text nodes from a tag subtree."""
+    nodes: list[str] = []
+    for node in tag.descendants:
+        if isinstance(node, NavigableString):
+            text = str(node)
+            if text.strip():
+                nodes.append(text)
+    return nodes
 
 
 # ---------------------------------------------------------------------------
@@ -193,16 +209,18 @@ class DocumentParser:
         soup = BeautifulSoup(content, "html.parser")
 
         blocks: list[Block] = []
+        html_text_nodes: list[list[str]] = []
         for tag in soup.find_all(_HTML_TAGS_OF_INTEREST):
             if not isinstance(tag, Tag):
                 continue
 
-            text = tag.get_text(strip=True)
+            text = tag.get_text(" ", strip=True)
             if not text:
                 continue
 
             tag_name = tag.name.lower()
             raw_html = str(tag)
+            text_nodes = _extract_tag_text_nodes(tag)
 
             if tag_name in _HEADING_TAG_LEVELS:
                 blocks.append(
@@ -213,20 +231,32 @@ class DocumentParser:
                         raw_html=raw_html,
                     )
                 )
+                html_text_nodes.append(text_nodes)
             elif tag_name == "p":
                 blocks.append(
                     Block(type=BlockType.PARAGRAPH, text=text, raw_html=raw_html)
                 )
+                html_text_nodes.append(text_nodes)
             elif tag_name == "li":
                 blocks.append(
                     Block(type=BlockType.LIST_ITEM, text=text, raw_html=raw_html)
                 )
+                html_text_nodes.append(text_nodes)
             elif tag_name == "table":
                 blocks.append(
                     Block(type=BlockType.TABLE, text=text, raw_html=raw_html)
                 )
+                html_text_nodes.append(text_nodes)
+            elif tag_name == "caption":
+                blocks.append(
+                    Block(type=BlockType.CAPTION, text=text, raw_html=raw_html)
+                )
+                html_text_nodes.append(text_nodes)
 
-        metadata: dict[str, Any] = {"soup_str": str(soup)}
+        metadata: dict[str, Any] = {
+            "soup_str": str(soup),
+            "html_text_nodes": html_text_nodes,
+        }
         return blocks, metadata
 
     # ------------------------------------------------------------------
@@ -274,12 +304,21 @@ class DocumentParser:
                                     text=text,
                                     bbox=tbl_bbox,
                                     page_index=page_idx,
+                                    table_cells=[
+                                        [
+                                            str(cell) if cell is not None else ""
+                                            for cell in row
+                                        ]
+                                        for row in cells
+                                    ],
+                                    non_translatable=True,
                                 )
                             )
 
                 # 2. Text from get_text("dict")
                 blocks_dict = page.get_text("dict", sort=True)
                 para_buffer: list[str] = []
+                para_runs: list[dict[str, Any]] = []
                 para_meta: dict[str, Any] = {}
 
                 def flush_paragraph() -> None:
@@ -293,10 +332,14 @@ class DocumentParser:
                                 font_size=para_meta.get("font_size", 10.0),
                                 is_bold=para_meta.get("is_bold", False),
                                 font_color=para_meta.get("font_color"),
+                                font_name=para_meta.get("font_name"),
+                                line_height=para_meta.get("line_height"),
+                                style_runs=para_runs.copy() if para_runs else None,
                                 page_index=page_idx,
                             )
                         )
                         para_buffer.clear()
+                        para_runs.clear()
                         para_meta.clear()
 
                 for block in blocks_dict.get("blocks", []):
@@ -319,12 +362,94 @@ class DocumentParser:
                             font_size = float(span.get("size", 10))
                             flags = int(span.get("flags", 0))
                             bold = bool(flags & _FLAG_BOLD)
+                            font_name = str(span.get("font", "helv"))
                             color = span.get("color", 0)
                             font_color = (
                                 _color_to_hex(color)
                                 if isinstance(color, int) and color != 0
                                 else None
                             )
+                            y0 = float(span_bbox[1])
+                            page_height = float(page.rect.height)
+
+                            if _LIST_BULLET_RE.match(span_text):
+                                flush_paragraph()
+                                blocks.append(
+                                    Block(
+                                        type=BlockType.LIST_ITEM,
+                                        text=span_text,
+                                        bbox=span_bbox,
+                                        font_size=font_size,
+                                        is_bold=bold,
+                                        font_color=font_color,
+                                        font_name=font_name,
+                                        line_height=font_size * 1.2,
+                                        style_runs=[
+                                            {
+                                                "text": span_text,
+                                                "font_name": font_name,
+                                                "font_size": font_size,
+                                                "is_bold": bold,
+                                                "font_color": font_color,
+                                                "bbox": span_bbox,
+                                            }
+                                        ],
+                                        page_index=page_idx,
+                                    )
+                                )
+                                continue
+
+                            if _CAPTION_RE.match(span_text):
+                                flush_paragraph()
+                                blocks.append(
+                                    Block(
+                                        type=BlockType.CAPTION,
+                                        text=span_text,
+                                        bbox=span_bbox,
+                                        font_size=font_size,
+                                        is_bold=bold,
+                                        font_color=font_color,
+                                        font_name=font_name,
+                                        line_height=font_size * 1.2,
+                                        page_index=page_idx,
+                                    )
+                                )
+                                continue
+
+                            if _FORM_FIELD_RE.match(span_text):
+                                flush_paragraph()
+                                blocks.append(
+                                    Block(
+                                        type=BlockType.FORM_FIELD,
+                                        text=span_text,
+                                        bbox=span_bbox,
+                                        font_size=font_size,
+                                        is_bold=bold,
+                                        font_color=font_color,
+                                        font_name=font_name,
+                                        line_height=font_size * 1.2,
+                                        page_index=page_idx,
+                                        non_translatable=True,
+                                    )
+                                )
+                                continue
+
+                            if y0 > page_height * 0.85 and font_size <= 9:
+                                flush_paragraph()
+                                blocks.append(
+                                    Block(
+                                        type=BlockType.FOOTNOTE,
+                                        text=span_text,
+                                        bbox=span_bbox,
+                                        font_size=font_size,
+                                        is_bold=bold,
+                                        font_color=font_color,
+                                        font_name=font_name,
+                                        line_height=font_size * 1.2,
+                                        page_index=page_idx,
+                                    )
+                                )
+                                continue
 
                             heading_level = _classify_heading(font_size)
                             if heading_level > 0:
@@ -338,6 +463,8 @@ class DocumentParser:
                                         font_size=font_size,
                                         is_bold=bold,
                                         font_color=font_color,
+                                        font_name=font_name,
+                                        line_height=font_size * 1.2,
                                         page_index=page_idx,
                                     )
                                 )
@@ -356,6 +483,8 @@ class DocumentParser:
                                         "font_size": font_size,
                                         "is_bold": bold,
                                         "font_color": font_color,
+                                        "font_name": font_name,
+                                        "line_height": font_size * 1.2,
                                     }
                                 else:
                                     prev_bbox = para_meta.get("bbox")
@@ -364,6 +493,16 @@ class DocumentParser:
                                             prev_bbox,
                                             span_bbox,
                                         )
+                                para_runs.append(
+                                    {
+                                        "text": span_text,
+                                        "font_name": font_name,
+                                        "font_size": font_size,
+                                        "is_bold": bold,
+                                        "font_color": font_color,
+                                        "bbox": span_bbox,
+                                    }
+                                )
                                 para_buffer.append(span_text)
                 flush_paragraph()
 

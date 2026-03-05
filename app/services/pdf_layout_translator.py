@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field, field_validator
 logger = logging.getLogger(__name__)
 
 _DEFAULT_FONT = "helv"
-_FONT_STEP = 0.5
 _UNICODE_FONT_PATHS = [
     Path("C:/Windows/Fonts/arial.ttf"),
     Path("C:/Windows/Fonts/tahoma.ttf"),
@@ -48,6 +47,7 @@ class TextBlock(BaseModel):
     font: str = _DEFAULT_FONT
     size: float = 10.0
     color: tuple[int, int, int] = (0, 0, 0)
+    line_height: float | None = None
     translated: str | None = None
 
     model_config = {"frozen": False}
@@ -110,6 +110,44 @@ def _font_candidates(
         candidates.append((_DEFAULT_FONT, None))
 
     return candidates
+
+
+def _rects_overlap(a: fitz.Rect, b: fitz.Rect) -> bool:
+    """Return True if two rectangles overlap."""
+    if a.x1 <= b.x0 or a.x0 >= b.x1:
+        return False
+    if a.y1 <= b.y0 or a.y0 >= b.y1:
+        return False
+    return True
+
+
+def _candidate_rects(
+    rect: fitz.Rect, page_rect: fitz.Rect, max_passes: int = 5
+) -> list[fitz.Rect]:
+    """Build candidate rectangles for local expansion."""
+    width = max(1.0, rect.width)
+    height = max(1.0, rect.height)
+    candidates: list[fitz.Rect] = [fitz.Rect(rect)]
+    for step in range(1, max_passes + 1):
+        extra_h = height * 0.35 * step
+        extra_w = width * 0.2 * step
+        down = fitz.Rect(rect.x0, rect.y0, rect.x1, min(page_rect.y1, rect.y1 + extra_h))
+        right = fitz.Rect(rect.x0, rect.y0, min(page_rect.x1, rect.x1 + extra_w), rect.y1)
+        down_right = fitz.Rect(
+            rect.x0,
+            rect.y0,
+            min(page_rect.x1, rect.x1 + extra_w),
+            min(page_rect.y1, rect.y1 + extra_h),
+        )
+        candidates.extend([down, right, down_right])
+    unique: list[fitz.Rect] = []
+    for item in candidates:
+        if item.width <= 0 or item.height <= 0:
+            continue
+        if any(existing == item for existing in unique):
+            continue
+        unique.append(item)
+    return unique
 
 
 def extract_text_blocks(doc: fitz.Document) -> list[TextBlock]:
@@ -205,12 +243,12 @@ def draw_translated_block(
     min_font: float = 6.0,
     font_delta: float = 0.0,
 ) -> bool:
-    """Draw translated text into block bbox with adaptive font size.
+    """Draw translated text into block bbox using expansion-first strategy.
 
     Args:
         page: Target PDF page.
         block: Target text block.
-        min_font: Minimum allowed font size.
+        min_font: Kept for backward compatibility; ignored by layout strategy.
         font_delta: Optional size adjustment added to original font size.
 
     Returns:
@@ -220,16 +258,20 @@ def draw_translated_block(
     if not text:
         return True
 
-    fontsize = max(min_font, block.size + font_delta)
+    fontsize = max(1.0, block.size + font_delta)
     color = _rgb_to_fitz(block.color)
     font_name = block.font or _DEFAULT_FONT
     candidates = _font_candidates(font_name, text)
+    lineheight = None
+    if block.line_height and fontsize > 0:
+        lineheight = max(0.8, block.line_height / fontsize)
 
-    while fontsize >= min_font:
+    for rect in _candidate_rects(block.rect, page.rect):
+        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
         for candidate_name, candidate_file in candidates:
             try:
                 remaining = page.insert_textbox(
-                    block.rect,
+                    rect,
                     text,
                     fontsize=fontsize,
                     fontname=candidate_name,
@@ -237,8 +279,10 @@ def draw_translated_block(
                     color=color,
                     align=fitz.TEXT_ALIGN_LEFT,
                     overlay=True,
+                    lineheight=lineheight,
                 )
                 if remaining >= 0:
+                    block.bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
                     return True
             except Exception as exc:
                 logger.warning(
@@ -247,7 +291,6 @@ def draw_translated_block(
                     block.page_index,
                     exc,
                 )
-        fontsize -= _FONT_STEP
 
     logger.warning(
         "Translated text does not fit block bbox page=%d bbox=%s",
@@ -268,10 +311,62 @@ def draw_translated_blocks(doc: fitz.Document, blocks: list[TextBlock]) -> int:
         Number of blocks that failed to draw.
     """
     failed_count = 0
+    page_blocks: dict[int, list[TextBlock]] = defaultdict(list)
     for block in blocks:
-        page = doc[block.page_index]
-        if not draw_translated_block(page, block):
-            failed_count += 1
+        page_blocks[block.page_index].append(block)
+
+    for page_index, page_group in page_blocks.items():
+        page = doc[page_index]
+        occupied: list[fitz.Rect] = []
+        sorted_blocks = sorted(
+            page_group,
+            key=lambda item: (item.bbox[1], item.bbox[0]),
+        )
+        for block in sorted_blocks:
+            original_rect = block.rect
+            placed = False
+            for candidate_rect in _candidate_rects(original_rect, page.rect):
+                moved_rect = fitz.Rect(candidate_rect)
+                max_shifts = 8
+                for _ in range(max_shifts):
+                    collisions = [
+                        existing
+                        for existing in occupied
+                        if _rects_overlap(moved_rect, existing)
+                    ]
+                    if not collisions:
+                        break
+                    max_bottom = max(item.y1 for item in collisions)
+                    delta = max_bottom - moved_rect.y0 + 2.0
+                    moved_rect = fitz.Rect(
+                        moved_rect.x0,
+                        moved_rect.y0 + delta,
+                        moved_rect.x1,
+                        moved_rect.y1 + delta,
+                    )
+                    if moved_rect.y1 > page.rect.y1:
+                        break
+                if moved_rect.y1 > page.rect.y1:
+                    continue
+
+                tmp_block = block.model_copy(
+                    update={
+                        "bbox": (
+                            moved_rect.x0,
+                            moved_rect.y0,
+                            moved_rect.x1,
+                            moved_rect.y1,
+                        )
+                    }
+                )
+                if draw_translated_block(page, tmp_block):
+                    block.bbox = tmp_block.bbox
+                    occupied.append(fitz.Rect(block.bbox))
+                    placed = True
+                    break
+
+            if not placed:
+                failed_count += 1
     if failed_count:
         logger.warning("Failed to draw %d translated blocks", failed_count)
     return failed_count

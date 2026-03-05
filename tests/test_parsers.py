@@ -137,6 +137,30 @@ async def test_parse_pdf_extracts_images(tmp_path: Path) -> None:
     assert "page_index" in images[0]
 
 
+async def test_parse_pdf_detects_layout_aware_block_types(tmp_path: Path) -> None:
+    """Parser should classify bullets, captions, and form-like lines."""
+    import pymupdf as fitz
+
+    pdf_path = tmp_path / "layout_types.pdf"
+    doc = fitz.open()
+    page = doc.new_page()
+    page.insert_text((72, 72), "- Bullet item", fontsize=12)
+    page.insert_text((72, 95), "Figure 1. Sample chart", fontsize=10)
+    page.insert_text((72, 118), "Name: ________", fontsize=11)
+    page.insert_text((72, 820), "Footer note", fontsize=8)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    parser = DocumentParser()
+    result = await parser.parse(str(pdf_path))
+
+    block_types = {block.type for block in result.blocks}
+    assert BlockType.LIST_ITEM in block_types
+    assert BlockType.CAPTION in block_types
+    assert BlockType.FORM_FIELD in block_types
+    assert BlockType.FOOTNOTE in block_types
+
+
 async def test_parse_unknown_extension_raises(tmp_path: Path) -> None:
     """Unsupported extension raises ValueError."""
     path = tmp_path / "doc.docx"

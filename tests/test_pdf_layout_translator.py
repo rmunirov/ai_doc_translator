@@ -1,6 +1,7 @@
 """Tests for PyMuPDF-based PDF layout translator utilities."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pymupdf as fitz
 
@@ -77,6 +78,33 @@ def test_draw_translated_block_reports_overflow() -> None:
     ok = draw_translated_block(page, block, min_font=6.0)
 
     assert ok is False
+    doc.close()
+
+
+def test_draw_translated_block_does_not_shrink_font() -> None:
+    doc = fitz.open()
+    page = doc.new_page()
+    block = TextBlock(
+        page_index=0,
+        bbox=(10.0, 10.0, 60.0, 24.0),
+        text="A",
+        font="helv",
+        size=11.0,
+        color=(0, 0, 0),
+        translated="Long long long long long long translated text",
+    )
+    calls: list[float] = []
+    original_insert = fitz.Page.insert_textbox
+
+    def _spy_insert(self, rect, text, **kwargs):  # type: ignore[no-untyped-def]
+        calls.append(float(kwargs["fontsize"]))
+        return original_insert(self, rect, text, **kwargs)
+
+    with patch.object(fitz.Page, "insert_textbox", _spy_insert):
+        draw_translated_block(page, block, min_font=6.0)
+
+    assert calls
+    assert all(size == 11.0 for size in calls)
     doc.close()
 
 

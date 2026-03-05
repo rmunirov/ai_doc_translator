@@ -9,13 +9,18 @@ from typing import Any
 
 import aiofiles
 import pymupdf as fitz
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 from app.models.schemas import Block, BlockType, Chunk, ParsedDocument
 from app.services.pdf_layout_translator import (
     TextBlock,
     clear_blocks,
     draw_translated_blocks,
+)
+from app.services.quality_metrics import (
+    layout_preservation_score,
+    overflow_resolution_rate,
+    style_preservation_rate,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,7 +46,18 @@ _UTF8_FONT_NAME = "UnicodeFont"
 _UTF8_FONT_BOLD_NAME = "UnicodeFont-Bold"
 
 # Same ordered tag list as document_parser.py — order determines block mapping.
-_HTML_TAGS_OF_INTEREST = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "table"]
+_HTML_TAGS_OF_INTEREST = [
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "p",
+    "li",
+    "table",
+    "caption",
+]
 
 _HEADING_STYLE_MAP = {1: "Heading1", 2: "Heading2", 3: "Heading3"}
 
@@ -217,14 +233,55 @@ def _assemble_html(soup_str: str, block_translations: list[str]) -> str:
     Returns:
         Prettified HTML string with translated text.
     """
+    def _extract_text_nodes(tag: Tag) -> list[NavigableString]:
+        nodes: list[NavigableString] = []
+        for node in tag.descendants:
+            if isinstance(node, NavigableString) and str(node).strip():
+                nodes.append(node)
+        return nodes
+
+    def _split_translation(
+        translated_text: str, node_texts: list[str]
+    ) -> list[str]:
+        if not node_texts:
+            return [translated_text]
+        if len(node_texts) == 1:
+            return [translated_text]
+        words = translated_text.split()
+        if not words:
+            return [""] * len(node_texts)
+        source_lengths = [max(1, len(text.strip())) for text in node_texts]
+        total_source = sum(source_lengths)
+        total_words = len(words)
+        raw_targets = [max(1, round(total_words * sl / total_source)) for sl in source_lengths]
+        targets = raw_targets[:-1]
+        targets.append(max(1, total_words - sum(targets)))
+
+        out: list[str] = []
+        start = 0
+        for idx, target in enumerate(targets):
+            if idx == len(targets) - 1:
+                out.append(" ".join(words[start:]).strip())
+                break
+            end = min(total_words, start + target)
+            out.append(" ".join(words[start:end]).strip())
+            start = end
+        while len(out) < len(node_texts):
+            out.append("")
+        return out
+
     soup = BeautifulSoup(soup_str, "html.parser")
     tags = [t for t in soup.find_all(_HTML_TAGS_OF_INTEREST) if isinstance(t, Tag)]
 
     for tag, translated_text in zip(tags, block_translations):
-        # Remove all existing children and insert translated text
-        for child in list(tag.children):
-            child.extract()
-        tag.append(translated_text)
+        text_nodes = _extract_text_nodes(tag)
+        node_texts = [str(node) for node in text_nodes]
+        parts = _split_translation(translated_text, node_texts)
+        if not text_nodes:
+            tag.append(translated_text)
+            continue
+        for node, part in zip(text_nodes, parts):
+            node.replace_with(part)
 
     return soup.prettify()
 
@@ -264,7 +321,10 @@ def _hex_to_rgb(font_color: str | None) -> tuple[int, int, int]:
 
 def _block_font_name(block: Block) -> str:
     """Map style metadata to a built-in PyMuPDF font."""
-    return "helvb" if block.is_bold else "helv"
+    font_name = (block.font_name or "").lower()
+    if block.is_bold or "bold" in font_name:
+        return "helvb"
+    return "helv"
 
 
 def _to_pdf_text_blocks(
@@ -279,13 +339,35 @@ def _to_pdf_text_blocks(
             continue
 
         translated = (
-            block_translations[idx].strip()
-            if idx < len(block_translations)
-            else ""
+            block_translations[idx].strip() if idx < len(block_translations) else ""
         )
+        if block.non_translatable:
+            translated = block.text
         if not translated:
             # Keep source text when translation cannot be mapped reliably.
             continue
+
+        use_size = float(block.font_size) if block.font_size else 10.0
+        use_color = _hex_to_rgb(block.font_color)
+        use_font = _block_font_name(block)
+        use_line_height = block.line_height
+        if block.style_runs:
+            runs = [
+                run for run in block.style_runs if isinstance(run.get("text"), str)
+            ]
+            if runs:
+                dominant = max(runs, key=lambda run: len(run.get("text", "")))
+                dom_size = dominant.get("font_size")
+                if isinstance(dom_size, (int, float)):
+                    use_size = float(dom_size)
+                dom_color = dominant.get("font_color")
+                if isinstance(dom_color, str):
+                    use_color = _hex_to_rgb(dom_color)
+                dom_font = str(dominant.get("font_name", ""))
+                if dom_font:
+                    use_font = "helvb" if "bold" in dom_font.lower() else "helv"
+                if use_line_height is None:
+                    use_line_height = use_size * 1.2
 
         result.append(
             TextBlock(
@@ -297,9 +379,10 @@ def _to_pdf_text_blocks(
                     float(block.bbox[3]),
                 ),
                 text=block.text,
-                font=_block_font_name(block),
-                size=float(block.font_size) if block.font_size else 10.0,
-                color=_hex_to_rgb(block.font_color),
+                font=use_font,
+                size=use_size,
+                color=use_color,
+                line_height=use_line_height,
                 translated=translated,
             )
         )
@@ -332,16 +415,25 @@ def _assemble_pdf_pymupdf_sync(
         with fitz.open(source_path) as doc:
             text_blocks = _to_pdf_text_blocks(blocks, block_translations)
             if text_blocks:
+                original_layout = [block.model_copy() for block in text_blocks]
                 clear_blocks(doc, text_blocks)
                 failed_count = draw_translated_blocks(doc, text_blocks)
+                layout_score = layout_preservation_score(original_layout, text_blocks)
+                style_score = style_preservation_rate(blocks, text_blocks)
+                overflow_score = overflow_resolution_rate(len(text_blocks), failed_count)
+                logger.info(
+                    "Assembly metrics layout=%.3f style=%.3f overflow=%.3f",
+                    layout_score,
+                    style_score,
+                    overflow_score,
+                )
                 if failed_count > 0:
                     warning = (
                         "PyMuPDF bbox draw failed for "
-                        f"{failed_count} blocks; kept source layout with partial draw"
+                        f"{failed_count} blocks; falling back to reportlab"
                     )
                     logger.warning(warning)
-                    doc.save(output_path, garbage=4, deflate=True)
-                    return True, warning
+                    return False, warning
                 doc.save(output_path, garbage=4, deflate=True)
                 return True, None
             warning = (
@@ -427,6 +519,21 @@ def _block_to_flowable(
     if block.type == BlockType.LIST_ITEM:
         style = _para_style("Normal")
         return Paragraph(f"• {translated_text}", style)
+
+    if block.type == BlockType.CAPTION:
+        style = _para_style("Normal")
+        style.fontSize = max(8, style.fontSize - 1)
+        return Paragraph(translated_text, style)
+
+    if block.type == BlockType.FOOTNOTE:
+        style = _para_style("Normal")
+        style.fontSize = min(style.fontSize, 8)
+        return Paragraph(translated_text, style)
+
+    if block.type == BlockType.FORM_FIELD:
+        style = _para_style("Normal")
+        text = translated_text if not block.non_translatable else block.text
+        return Paragraph(text, style)
 
     # PARAGRAPH / CODE / fallback
     style = _para_style("Normal")

@@ -21,6 +21,10 @@ class BlockType(str, enum.Enum):
     TABLE = "table"
     LIST_ITEM = "list_item"
     CODE = "code"
+    FORM_FIELD = "form_field"
+    CAPTION = "caption"
+    FOOTNOTE = "footnote"
+    HEADER = "header"
 
 
 class Block(BaseModel):
@@ -33,6 +37,12 @@ class Block(BaseModel):
     font_size: float | None = None
     font_color: str | None = None  # hex "#RRGGBB"
     is_bold: bool = False
+    font_name: str | None = None
+    line_height: float | None = None
+    style_runs: list[dict[str, Any]] | None = None
+    table_cells: list[list[str]] | None = None
+    layout_label: str | None = None
+    non_translatable: bool = False
     raw_html: str | None = None
     page_index: int | None = None
 
