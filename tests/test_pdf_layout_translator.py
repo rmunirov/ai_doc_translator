@@ -142,7 +142,8 @@ def test_translate_pdf_end_to_end(tmp_path: Path) -> None:
     assert output_pdf.exists()
     with fitz.open(str(output_pdf)) as doc:
         text = doc[0].get_text("text")
-    assert "ru:Hello PDF" in text
+    # Accept both single-line and wrapped output
+    assert "ru:Hello" in text and "PDF" in text
 
 
 def test_draw_translated_blocks_pushes_down_lower_blocks() -> None:

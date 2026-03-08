@@ -1,7 +1,7 @@
 """Parsers that convert PDF, HTML, and TXT files into a structured ParsedDocument."""
 
 import asyncio
-import io
+import concurrent.futures
 import logging
 import re
 import uuid
@@ -13,6 +13,7 @@ import pymupdf
 from bs4 import BeautifulSoup, Tag
 from bs4.element import NavigableString
 
+from app.config import get_settings
 from app.models.schemas import (
     Block,
     BlockType,
@@ -23,6 +24,10 @@ from app.models.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_PDF_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="pdf_parser"
+)
 
 _HEADING_TAG_LEVELS: dict[str, int] = {
     "h1": 1,
@@ -40,6 +45,18 @@ _HTML_TAGS_OF_INTEREST = [
 
 # PyMuPDF span flags: bold = 2^4
 _FLAG_BOLD = 16
+
+# Footnote detection: text in bottom 15% of page with small font
+_FOOTNOTE_Y_THRESHOLD = 0.85
+_FOOTNOTE_MAX_FONT_SIZE = 9.0
+
+# Paragraph merge heuristics
+_PARAGRAPH_MERGE_GAP_MIN = 4.0
+_PARAGRAPH_MERGE_GAP_MAX = 28.0
+_PARAGRAPH_MERGE_INDENT_DELTA = 26.0
+_PARAGRAPH_MERGE_GAP_MULTIPLIER = 1.1
+_PARAGRAPH_MERGE_FONT_TOLERANCE = 1.4
+_PARAGRAPH_MERGE_Y_GAP_MIN = -3.0
 
 
 # ---------------------------------------------------------------------------
@@ -182,29 +199,40 @@ def _merge_page_paragraph_fragments(page_blocks: list[Block]) -> list[Block]:
             and merged[-1].bbox is not None
         ):
             prev = merged[-1]
-            assert prev.bbox is not None
-            x_delta = abs(block.bbox[0] - prev.bbox[0])
-            y_gap = block.bbox[1] - prev.bbox[3]
-            gap_limit = max(4.0, min(28.0, max(_line_gap(block), _line_gap(prev)) * 1.1))
+            prev_bbox = merged[-1].bbox
+            if prev_bbox is None:
+                merged.append(block)
+                continue
+            x_delta = abs(block.bbox[0] - prev_bbox[0])
+            y_gap = block.bbox[1] - prev_bbox[3]
+            gap_limit = max(
+                _PARAGRAPH_MERGE_GAP_MIN,
+                min(
+                    _PARAGRAPH_MERGE_GAP_MAX,
+                    max(_line_gap(block), _line_gap(prev))
+                    * _PARAGRAPH_MERGE_GAP_MULTIPLIER,
+                ),
+            )
             similar_font = (
                 prev.font_size is None
                 or block.font_size is None
-                or abs(prev.font_size - block.font_size) <= 1.4
+                or abs(prev.font_size - block.font_size)
+                <= _PARAGRAPH_MERGE_FONT_TOLERANCE
             )
             same_column = _column_id(block) == _column_id(prev)
             continuation = not _ends_sentence(prev.text)
-            same_indent = x_delta <= 26.0
+            same_indent = x_delta <= _PARAGRAPH_MERGE_INDENT_DELTA
             if (
                 same_column
                 and similar_font
-                and -3.0 <= y_gap <= gap_limit
+                and _PARAGRAPH_MERGE_Y_GAP_MIN <= y_gap <= gap_limit
                 and (same_indent or continuation)
             ):
                 merged_text = f"{prev.text} {block.text}".strip()
                 merged[-1] = prev.model_copy(
                     update={
                         "text": merged_text,
-                        "bbox": _merge_bbox(prev.bbox, block.bbox),
+                        "bbox": _merge_bbox(prev_bbox, block.bbox),
                         "style_runs": (prev.style_runs or []) + (block.style_runs or []),
                     }
                 )
@@ -242,6 +270,17 @@ class DocumentParser:
 
         if not p.exists():
             raise FileNotFoundError(f"File not found: {path}")
+
+        try:
+            size = p.stat().st_size
+        except OSError as exc:
+            raise FileNotFoundError(f"Cannot access file: {path}") from exc
+
+        max_size = get_settings().max_file_size_mb * 1024 * 1024
+        if size > max_size:
+            raise ValueError(
+                f"File too large: {size} bytes (max {max_size} bytes)"
+            )
 
         if ext == ".pdf":
             blocks, metadata = await self._parse_pdf(path)
@@ -344,7 +383,9 @@ class DocumentParser:
     ) -> tuple[list[Block], dict[str, Any]]:
         """Extract text, tables, and images from each page of a PDF file."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._parse_pdf_sync, path)
+        return await loop.run_in_executor(
+            _PDF_EXECUTOR, self._parse_pdf_sync, path
+        )
 
     def _parse_pdf_sync(
         self, path: str
@@ -513,7 +554,10 @@ class DocumentParser:
                                 )
                                 continue
 
-                            if y0 > page_height * 0.85 and font_size <= 9:
+                            if (
+                                y0 > page_height * _FOOTNOTE_Y_THRESHOLD
+                                and font_size <= _FOOTNOTE_MAX_FONT_SIZE
+                            ):
                                 flush_paragraph()
                                 blocks.append(
                                     Block(
@@ -590,7 +634,11 @@ class DocumentParser:
                     xref = img_item[0]
                     try:
                         img_data = doc.extract_image(xref)
-                    except Exception as exc:
+                    except (
+                        pymupdf.FileDataError,
+                        ValueError,
+                        RuntimeError,
+                    ) as exc:
                         logger.warning(
                             "Failed to extract image xref=%s: %s",
                             xref,

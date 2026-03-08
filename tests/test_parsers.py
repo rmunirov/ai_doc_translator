@@ -1,6 +1,7 @@
 """Tests for DocumentParser — TXT, HTML, PDF."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -199,4 +200,56 @@ async def test_parse_unknown_extension_raises(tmp_path: Path) -> None:
     path.write_text("content", encoding="utf-8")
     parser = DocumentParser()
     with pytest.raises(ValueError, match="Unsupported file extension"):
+        await parser.parse(str(path))
+
+
+async def test_parse_file_not_found_raises() -> None:
+    """FileNotFoundError when path does not exist."""
+    parser = DocumentParser()
+    with pytest.raises(FileNotFoundError, match="File not found"):
+        await parser.parse("/nonexistent/path/doc.pdf")
+
+
+async def test_parse_file_too_large_raises(tmp_path: Path) -> None:
+    """ValueError when file exceeds size limit."""
+    path = tmp_path / "large.txt"
+    path.write_text("x" * 100, encoding="utf-8")
+    parser = DocumentParser()
+    with patch("app.services.document_parser.get_settings") as mock_settings:
+        mock_settings.return_value.max_file_size_mb = 0
+        with pytest.raises(ValueError, match="File too large"):
+            await parser.parse(str(path))
+
+
+async def test_parse_txt_invalid_encoding(tmp_path: Path) -> None:
+    """Non-UTF-8 TXT raises UnicodeDecodeError."""
+    path = tmp_path / "latin1.txt"
+    path.write_bytes("café".encode("latin-1"))
+    parser = DocumentParser()
+    with pytest.raises(UnicodeDecodeError):
+        await parser.parse(str(path))
+
+
+async def test_parse_pdf_empty(tmp_path: Path) -> None:
+    """Empty PDF returns empty blocks list."""
+    import pymupdf as fitz
+
+    pdf_path = tmp_path / "empty.pdf"
+    doc = fitz.open()
+    doc.new_page()
+    doc.save(str(pdf_path))
+    doc.close()
+
+    parser = DocumentParser()
+    result = await parser.parse(str(pdf_path))
+    assert result.format == "pdf"
+    assert len(result.blocks) == 0
+
+
+async def test_parse_pdf_corrupt_raises(tmp_path: Path) -> None:
+    """Corrupt PDF raises an exception."""
+    path = tmp_path / "corrupt.pdf"
+    path.write_bytes(b"not a valid PDF")
+    parser = DocumentParser()
+    with pytest.raises(Exception):
         await parser.parse(str(path))

@@ -132,7 +132,7 @@ def _candidate_rects(
     height = max(1.0, rect.height)
     candidates: list[fitz.Rect] = [fitz.Rect(rect)]
     for step in range(1, max_passes + 1):
-        extra_h = height * 0.35 * step
+        extra_h = height * 0.55 * step  # More aggressive for lineheight >= 1.0
         extra_w = width * 0.2 * step
         down = fitz.Rect(rect.x0, rect.y0, rect.x1, min(page_rect.y1, rect.y1 + extra_h))
         right = fitz.Rect(rect.x0, rect.y0, min(page_rect.x1, rect.x1 + extra_w), rect.y1)
@@ -157,11 +157,13 @@ def _lineheight_candidates(block: TextBlock) -> list[float | None]:
     """Return lineheight candidates for adaptive placement."""
     if not block.line_height or block.size <= 0:
         return [None]
-    base_ratio = max(0.8, block.line_height / block.size)
+    base_ratio = block.line_height / block.size
     strict_types = {"heading", "caption", "form_field", "table", "header"}
     if block.block_type in strict_types:
-        return [base_ratio]
-    return [base_ratio, max(0.92, base_ratio * 0.96), max(0.88, base_ratio * 0.92)]
+        return [max(0.8, base_ratio)]
+    # Paragraphs: never use lineheight < 1.0 to avoid descender/ascender overlap
+    safe_ratio = max(1.0, base_ratio)
+    return [safe_ratio]
 
 
 def extract_text_blocks(doc: fitz.Document) -> list[TextBlock]:
@@ -386,7 +388,15 @@ def draw_translated_blocks(doc: fitz.Document, blocks: list[TextBlock]) -> int:
                 ):
                     block.bbox = tmp_block.bbox
                     block.line_height = tmp_block.line_height
-                    occupied_by_column[column_id].append(fitz.Rect(block.bbox))
+                    placed_rect = fitz.Rect(block.bbox)
+                    occupied_by_column[column_id].append(
+                        fitz.Rect(
+                            placed_rect.x0,
+                            placed_rect.y0,
+                            placed_rect.x1,
+                            placed_rect.y1 + 2.0,
+                        )
+                    )  # +2pt descender clearance
                     placed = True
                     break
 
