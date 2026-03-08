@@ -11,6 +11,7 @@ import pymupdf as fitz
 from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger(__name__)
+LAST_DRAW_STATS: dict[str, object] = {}
 
 _DEFAULT_FONT = "helv"
 _UNICODE_FONT_PATHS = [
@@ -48,6 +49,8 @@ class TextBlock(BaseModel):
     size: float = 10.0
     color: tuple[int, int, int] = (0, 0, 0)
     line_height: float | None = None
+    column_id: int = 0
+    block_type: str = "paragraph"
     translated: str | None = None
 
     model_config = {"frozen": False}
@@ -150,6 +153,17 @@ def _candidate_rects(
     return unique
 
 
+def _lineheight_candidates(block: TextBlock) -> list[float | None]:
+    """Return lineheight candidates for adaptive placement."""
+    if not block.line_height or block.size <= 0:
+        return [None]
+    base_ratio = max(0.8, block.line_height / block.size)
+    strict_types = {"heading", "caption", "form_field", "table", "header"}
+    if block.block_type in strict_types:
+        return [base_ratio]
+    return [base_ratio, max(0.92, base_ratio * 0.96), max(0.88, base_ratio * 0.92)]
+
+
 def extract_text_blocks(doc: fitz.Document) -> list[TextBlock]:
     """Extract span-level text blocks with style data from a PDF.
 
@@ -242,6 +256,7 @@ def draw_translated_block(
     block: TextBlock,
     min_font: float = 6.0,
     font_delta: float = 0.0,
+    forbidden_rects: list[fitz.Rect] | None = None,
 ) -> bool:
     """Draw translated text into block bbox using expansion-first strategy.
 
@@ -262,35 +277,39 @@ def draw_translated_block(
     color = _rgb_to_fitz(block.color)
     font_name = block.font or _DEFAULT_FONT
     candidates = _font_candidates(font_name, text)
-    lineheight = None
-    if block.line_height and fontsize > 0:
-        lineheight = max(0.8, block.line_height / fontsize)
+    forbidden = forbidden_rects or []
+    expand_passes = 3 if block.block_type in {"heading", "caption", "table"} else 7
+    lineheight_candidates = _lineheight_candidates(block)
 
-    for rect in _candidate_rects(block.rect, page.rect):
-        page.draw_rect(rect, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
-        for candidate_name, candidate_file in candidates:
-            try:
-                remaining = page.insert_textbox(
-                    rect,
-                    text,
-                    fontsize=fontsize,
-                    fontname=candidate_name,
-                    fontfile=candidate_file,
-                    color=color,
-                    align=fitz.TEXT_ALIGN_LEFT,
-                    overlay=True,
-                    lineheight=lineheight,
-                )
-                if remaining >= 0:
-                    block.bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
-                    return True
-            except Exception as exc:
-                logger.warning(
-                    "Failed font candidate '%s' for page %d: %s",
-                    candidate_name,
-                    block.page_index,
-                    exc,
-                )
+    for rect in _candidate_rects(block.rect, page.rect, max_passes=expand_passes):
+        if any(_rects_overlap(rect, taken) for taken in forbidden):
+            continue
+        for lineheight_ratio in lineheight_candidates:
+            for candidate_name, candidate_file in candidates:
+                try:
+                    remaining = page.insert_textbox(
+                        rect,
+                        text,
+                        fontsize=fontsize,
+                        fontname=candidate_name,
+                        fontfile=candidate_file,
+                        color=color,
+                        align=fitz.TEXT_ALIGN_LEFT,
+                        overlay=True,
+                        lineheight=lineheight_ratio,
+                    )
+                    if remaining >= 0:
+                        block.bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+                        if lineheight_ratio is not None:
+                            block.line_height = max(0.0, lineheight_ratio * fontsize)
+                        return True
+                except Exception as exc:
+                    logger.warning(
+                        "Failed font candidate '%s' for page %d: %s",
+                        candidate_name,
+                        block.page_index,
+                        exc,
+                    )
 
     logger.warning(
         "Translated text does not fit block bbox page=%d bbox=%s",
@@ -315,60 +334,97 @@ def draw_translated_blocks(doc: fitz.Document, blocks: list[TextBlock]) -> int:
     for block in blocks:
         page_blocks[block.page_index].append(block)
 
+    heatmap: dict[tuple[int, int], dict[str, int]] = defaultdict(
+        lambda: {"placed": 0, "failed": 0, "max_push_depth": 0}
+    )
+    by_type: dict[str, dict[str, int]] = defaultdict(lambda: {"placed": 0, "failed": 0})
+
     for page_index, page_group in page_blocks.items():
         page = doc[page_index]
-        occupied: list[fitz.Rect] = []
+        occupied_by_column: dict[int, list[fitz.Rect]] = defaultdict(list)
         sorted_blocks = sorted(
             page_group,
             key=lambda item: (item.bbox[1], item.bbox[0]),
         )
         for block in sorted_blocks:
-            original_rect = block.rect
+            column_id = block.column_id
+            push_depth = 0
+            current_rect = fitz.Rect(block.rect)
             placed = False
-            for candidate_rect in _candidate_rects(original_rect, page.rect):
-                moved_rect = fitz.Rect(candidate_rect)
-                max_shifts = 8
-                for _ in range(max_shifts):
-                    collisions = [
-                        existing
-                        for existing in occupied
-                        if _rects_overlap(moved_rect, existing)
-                    ]
-                    if not collisions:
-                        break
+            while current_rect.y1 <= page.rect.y1:
+                collisions = [
+                    existing
+                    for existing in occupied_by_column[column_id]
+                    if _rects_overlap(current_rect, existing)
+                ]
+                if collisions:
                     max_bottom = max(item.y1 for item in collisions)
-                    delta = max_bottom - moved_rect.y0 + 2.0
-                    moved_rect = fitz.Rect(
-                        moved_rect.x0,
-                        moved_rect.y0 + delta,
-                        moved_rect.x1,
-                        moved_rect.y1 + delta,
+                    delta = max_bottom - current_rect.y0 + 2.0
+                    current_rect = fitz.Rect(
+                        current_rect.x0,
+                        current_rect.y0 + delta,
+                        current_rect.x1,
+                        current_rect.y1 + delta,
                     )
-                    if moved_rect.y1 > page.rect.y1:
-                        break
-                if moved_rect.y1 > page.rect.y1:
+                    push_depth += 1
                     continue
 
                 tmp_block = block.model_copy(
                     update={
                         "bbox": (
-                            moved_rect.x0,
-                            moved_rect.y0,
-                            moved_rect.x1,
-                            moved_rect.y1,
+                            current_rect.x0,
+                            current_rect.y0,
+                            current_rect.x1,
+                            current_rect.y1,
                         )
                     }
                 )
-                if draw_translated_block(page, tmp_block):
+                if draw_translated_block(
+                    page,
+                    tmp_block,
+                    forbidden_rects=occupied_by_column[column_id],
+                ):
                     block.bbox = tmp_block.bbox
-                    occupied.append(fitz.Rect(block.bbox))
+                    block.line_height = tmp_block.line_height
+                    occupied_by_column[column_id].append(fitz.Rect(block.bbox))
                     placed = True
                     break
 
-            if not placed:
+                current_rect = fitz.Rect(
+                    current_rect.x0,
+                    current_rect.y0 + 6.0,
+                    current_rect.x1,
+                    current_rect.y1 + 6.0,
+                )
+                push_depth += 1
+
+            bucket = heatmap[(page_index, column_id)]
+            bucket["max_push_depth"] = max(bucket["max_push_depth"], push_depth)
+            if placed:
+                bucket["placed"] += 1
+                by_type[block.block_type]["placed"] += 1
+            else:
+                bucket["failed"] += 1
+                by_type[block.block_type]["failed"] += 1
                 failed_count += 1
     if failed_count:
         logger.warning("Failed to draw %d translated blocks", failed_count)
+    for (page_index, column_id), stats in sorted(heatmap.items()):
+        logger.info(
+            "Reflow heatmap page=%d column=%d placed=%d failed=%d max_push=%d",
+            page_index,
+            column_id,
+            stats["placed"],
+            stats["failed"],
+            stats["max_push_depth"],
+        )
+    global LAST_DRAW_STATS
+    LAST_DRAW_STATS = {
+        "heatmap": {f"{page}:{col}": stats for (page, col), stats in heatmap.items()},
+        "by_type": dict(by_type),
+        "failed_count": failed_count,
+        "total_blocks": len(blocks),
+    }
     return failed_count
 
 

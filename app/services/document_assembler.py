@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import logging
 import re
 from pathlib import Path
@@ -11,15 +12,25 @@ import aiofiles
 import pymupdf as fitz
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-from app.models.schemas import Block, BlockType, Chunk, ParsedDocument
+from app.models.schemas import (
+    Block,
+    BlockType,
+    Chunk,
+    DocumentLayoutIR,
+    LayoutBlock,
+    ParsedDocument,
+)
 from app.services.pdf_layout_translator import (
     TextBlock,
     clear_blocks,
     draw_translated_blocks,
 )
+from app.services import pdf_layout_translator as pdf_layout_runtime
 from app.services.quality_metrics import (
     layout_preservation_score,
+    overlap_count,
     overflow_resolution_rate,
+    reading_order_violations,
     style_preservation_rate,
 )
 
@@ -146,6 +157,30 @@ def _distribute_translated_text(chunk: Chunk, translated: str) -> list[str]:
     return out
 
 
+def _normalize_table_translation(block: Block, translated_text: str) -> str:
+    """Normalize table translation to JSON string with cell matrix."""
+    text = translated_text.strip()
+    if not text:
+        return json.dumps(block.table_cells or [], ensure_ascii=False)
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            cells = parsed.get("cells")
+            if isinstance(cells, list):
+                return json.dumps(cells, ensure_ascii=False)
+        if isinstance(parsed, list):
+            return json.dumps(parsed, ensure_ascii=False)
+    except Exception:
+        pass
+
+    if "|" in text:
+        rows = _parse_pipe_table(text)
+        return json.dumps(rows, ensure_ascii=False)
+    if block.table_cells:
+        return json.dumps(block.table_cells, ensure_ascii=False)
+    return json.dumps([[text]], ensure_ascii=False)
+
+
 def _register_utf8_font() -> str:
     """Register a Unicode/Cyrillic-capable font. Return base font name for use."""
     try:
@@ -200,7 +235,15 @@ def _get_block_translations(
         else:
             redistributed = _distribute_translated_text(chunk, translated)
             result.extend(redistributed)
-    return result
+
+    normalized: list[str] = []
+    flat_blocks = [block for chunk in chunks for block in chunk.blocks]
+    for idx, text in enumerate(result):
+        if idx < len(flat_blocks) and flat_blocks[idx].type == BlockType.TABLE:
+            normalized.append(_normalize_table_translation(flat_blocks[idx], text))
+        else:
+            normalized.append(text)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +338,21 @@ def _parse_pipe_table(text: str) -> list[list[str]]:
     Returns:
         2-D list of cell strings.
     """
+    parsed_json = None
+    try:
+        parsed_json = json.loads(text)
+    except Exception:
+        parsed_json = None
+    if isinstance(parsed_json, list):
+        out_rows: list[list[str]] = []
+        for row in parsed_json:
+            if isinstance(row, list):
+                out_rows.append([str(cell) for cell in row])
+            else:
+                out_rows.append([str(row)])
+        if out_rows:
+            return out_rows
+
     rows: list[list[str]] = []
     for line in text.splitlines():
         cells = [c.strip() for c in line.split("|")]
@@ -332,6 +390,21 @@ def _to_pdf_text_blocks(
 ) -> list[TextBlock]:
     """Build TextBlock objects for PDF in-place redraw."""
     result: list[TextBlock] = []
+    page_x_mids: dict[int, list[float]] = {}
+    for block in blocks:
+        if block.page_index is None or block.bbox is None:
+            continue
+        x_mid = (float(block.bbox[0]) + float(block.bbox[2])) / 2
+        page_x_mids.setdefault(int(block.page_index), []).append(x_mid)
+
+    page_split_x: dict[int, float] = {}
+    for page_index, mids in page_x_mids.items():
+        if len(mids) < 6:
+            continue
+        sorted_mids = sorted(mids)
+        midpoint = sorted_mids[len(sorted_mids) // 2]
+        page_split_x[page_index] = midpoint
+
     for idx, block in enumerate(blocks):
         if block.page_index is None or block.bbox is None:
             continue
@@ -343,6 +416,9 @@ def _to_pdf_text_blocks(
         )
         if block.non_translatable:
             translated = block.text
+        if block.type == BlockType.TABLE:
+            cells = _parse_pipe_table(translated)
+            translated = "\n".join(" | ".join(row) for row in cells)
         if not translated:
             # Keep source text when translation cannot be mapped reliably.
             continue
@@ -383,10 +459,100 @@ def _to_pdf_text_blocks(
                 size=use_size,
                 color=use_color,
                 line_height=use_line_height,
+                column_id=(
+                    1
+                    if (
+                        block.page_index in page_split_x
+                        and ((float(block.bbox[0]) + float(block.bbox[2])) / 2)
+                        > page_split_x[block.page_index]
+                    )
+                    else 0
+                ),
+                block_type=block.type.value,
                 translated=translated,
             )
         )
     return result
+
+
+def _paragraph_fragmentation_rate(blocks: list[Block]) -> float:
+    """Estimate paragraph fragmentation: many short paragraph blocks -> higher."""
+    paragraph_blocks = [b for b in blocks if b.type == BlockType.PARAGRAPH]
+    if not paragraph_blocks:
+        return 0.0
+    short_count = sum(1 for b in paragraph_blocks if len(b.text.split()) <= 4)
+    return short_count / len(paragraph_blocks)
+
+
+def _to_layout_ir(
+    blocks: list[Block], block_translations: list[str]
+) -> DocumentLayoutIR:
+    """Build stable layout IR from parsed blocks and mapped translations."""
+    pages: dict[int, list[LayoutBlock]] = {}
+    for idx, block in enumerate(blocks):
+        if block.page_index is None or block.bbox is None:
+            continue
+        translated = block_translations[idx] if idx < len(block_translations) else ""
+        page = int(block.page_index)
+        pages.setdefault(page, [])
+        pages[page].append(
+            LayoutBlock(
+                block_id=f"blk_{page}_{idx}",
+                page=page,
+                type=block.type,
+                bbox=block.bbox,
+                text=translated if not block.non_translatable else block.text,
+                style={
+                    "font_size": block.font_size,
+                    "font_color": block.font_color,
+                    "font_name": block.font_name,
+                    "is_bold": block.is_bold,
+                    "line_height": block.line_height,
+                },
+                reading_order=len(pages[page]),
+                column_id=0,
+                non_translatable=block.non_translatable,
+                table_cells=block.table_cells,
+            )
+        )
+    ir_pages = []
+    for page, page_blocks in sorted(pages.items()):
+        ir_pages.append(
+            {
+                "page": page,
+                "width": 0.0,
+                "height": 0.0,
+                "blocks": page_blocks,
+            }
+        )
+    return DocumentLayoutIR.model_validate({"pages": ir_pages})
+
+
+def _coalesce_pdf_block_translations(
+    blocks: list[Block], block_translations: list[str]
+) -> list[str]:
+    """Merge tiny adjacent paragraph translations to reduce fragmentation."""
+    if len(blocks) != len(block_translations):
+        return block_translations
+    out = block_translations.copy()
+    for idx in range(1, len(blocks)):
+        prev_block = blocks[idx - 1]
+        block = blocks[idx]
+        if (
+            prev_block.type != BlockType.PARAGRAPH
+            or block.type != BlockType.PARAGRAPH
+            or prev_block.page_index != block.page_index
+            or prev_block.bbox is None
+            or block.bbox is None
+        ):
+            continue
+        y_gap = float(block.bbox[1] - prev_block.bbox[3])
+        x_gap = abs(float(block.bbox[0] - prev_block.bbox[0]))
+        short_translation = len(out[idx].split()) <= 5
+        if -2.0 <= y_gap <= 16.0 and x_gap <= 20.0 and short_translation:
+            out[idx - 1] = f"{out[idx - 1]} {out[idx]}".strip()
+            out[idx] = ""
+    return out
 
 
 def _assemble_pdf_pymupdf_sync(
@@ -394,56 +560,113 @@ def _assemble_pdf_pymupdf_sync(
     block_translations: list[str],
     output_path: str,
     source_path: str | None,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[bool, str | None]:
-    """Assemble PDF by replacing text in original bboxes with PyMuPDF.
+    """Assemble PDF using page rebuild with original page geometry.
 
     Returns:
         Tuple (success, warning_message).
     """
-    if not source_path:
-        warning = "source_path is required for PyMuPDF PDF assembly"
-        logger.warning(warning)
-        return False, warning
+    def _insert_images(doc: fitz.Document, images_meta: list[dict[str, Any]]) -> None:
+        for image in images_meta:
+            page_index = int(image.get("page_index", 0))
+            if page_index < 0 or page_index >= len(doc):
+                continue
+            bbox = image.get("bbox")
+            img_bytes = image.get("image_bytes")
+            if (
+                not isinstance(bbox, (tuple, list))
+                or len(bbox) < 4
+                or not isinstance(img_bytes, (bytes, bytearray))
+            ):
+                continue
+            rect = fitz.Rect(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+            try:
+                doc[page_index].insert_image(rect, stream=img_bytes, overlay=True)
+            except Exception as exc:
+                logger.warning("Failed to place image on page %d: %s", page_index, exc)
 
-    source = Path(source_path)
-    if not source.exists():
-        warning = f"source PDF does not exist: {source_path}"
-        logger.warning(warning)
-        return False, warning
+    source = Path(source_path) if source_path else None
+    images_meta = (metadata or {}).get("images", [])
 
     try:
-        with fitz.open(source_path) as doc:
-            text_blocks = _to_pdf_text_blocks(blocks, block_translations)
-            if text_blocks:
-                original_layout = [block.model_copy() for block in text_blocks]
-                clear_blocks(doc, text_blocks)
-                failed_count = draw_translated_blocks(doc, text_blocks)
-                layout_score = layout_preservation_score(original_layout, text_blocks)
-                style_score = style_preservation_rate(blocks, text_blocks)
-                overflow_score = overflow_resolution_rate(len(text_blocks), failed_count)
-                logger.info(
-                    "Assembly metrics layout=%.3f style=%.3f overflow=%.3f",
-                    layout_score,
-                    style_score,
-                    overflow_score,
-                )
-                if failed_count > 0:
-                    warning = (
-                        "PyMuPDF bbox draw failed for "
-                        f"{failed_count} blocks; falling back to reportlab"
+        rebuilt_doc = fitz.open()
+        layout_ir = _to_layout_ir(blocks, block_translations)
+
+        if source and source.exists():
+            with fitz.open(str(source)) as source_doc:
+                for page_index in range(len(source_doc)):
+                    source_page = source_doc[page_index]
+                    target_page = rebuilt_doc.new_page(
+                        width=source_page.rect.width,
+                        height=source_page.rect.height,
                     )
-                    logger.warning(warning)
-                    return False, warning
-                doc.save(output_path, garbage=4, deflate=True)
-                return True, None
+                    target_page.show_pdf_page(
+                        target_page.rect,
+                        source_doc,
+                        page_index,
+                    )
+        else:
+            page_count = int((metadata or {}).get("page_count") or 0)
+            max_index = max((block.page_index or 0) for block in blocks) if blocks else 0
+            total_pages = max(page_count, max_index + 1, 1)
+            default_width = 595.0
+            default_height = 842.0
+            for page_idx in range(total_pages):
+                rebuilt_doc.new_page(width=default_width, height=default_height)
+            _insert_images(rebuilt_doc, images_meta)
+
+        text_blocks = _to_pdf_text_blocks(blocks, block_translations)
+        if not text_blocks:
+            rebuilt_doc.save(output_path, garbage=4, deflate=True)
+            rebuilt_doc.close()
+            return True, "No drawable translated blocks; source pages copied as-is"
+
+        original_layout = [block.model_copy() for block in text_blocks]
+        if source and source.exists():
+            clear_blocks(rebuilt_doc, text_blocks)
+        failed_count = draw_translated_blocks(rebuilt_doc, text_blocks)
+        layout_score = layout_preservation_score(original_layout, text_blocks)
+        style_score = style_preservation_rate(blocks, text_blocks)
+        overflow_score = overflow_resolution_rate(len(text_blocks), failed_count)
+        logger.info(
+            "Assembly metrics layout=%.3f style=%.3f overflow=%.3f",
+            layout_score,
+            style_score,
+            overflow_score,
+        )
+        logger.info(
+            "Assembly readability overlap_count=%d order_violations=%d",
+            overlap_count(text_blocks),
+            reading_order_violations(text_blocks),
+        )
+        logger.info(
+            "Assembly diagnostics blocks_total=%d draw_failed=%d fragmentation=%.3f",
+            len(text_blocks),
+            failed_count,
+            _paragraph_fragmentation_rate(blocks),
+        )
+        logger.info(
+            "Layout IR pages=%d blocks=%d",
+            len(layout_ir.pages),
+            sum(len(page.blocks) for page in layout_ir.pages),
+        )
+        draw_stats = pdf_layout_runtime.LAST_DRAW_STATS or {}
+        if draw_stats:
+            logger.info("Draw diagnostics %s", draw_stats)
+        warning = None
+        if failed_count > 0:
             warning = (
-                "No drawable translated blocks for PDF bbox assembly; "
-                "falling back to reportlab"
+                "Page rebuild placed with overflow warnings: "
+                f"{failed_count} blocks could not be fully drawn"
             )
             logger.warning(warning)
-            return False, warning
+
+        rebuilt_doc.save(output_path, garbage=4, deflate=True)
+        rebuilt_doc.close()
+        return True, warning
     except Exception as exc:
-        warning = f"PyMuPDF PDF assembly failed, fallback to reportlab: {exc}"
+        warning = f"PyMuPDF page rebuild failed: {exc}"
         logger.warning(warning)
         return False, warning
 
@@ -684,6 +907,10 @@ async def assemble_document(
                 await f.write(html_content)
 
     elif fmt == "pdf":
+        block_translations = _coalesce_pdf_block_translations(
+            original.blocks,
+            block_translations,
+        )
         loop = asyncio.get_running_loop()
         ok, warning = await loop.run_in_executor(
             None,
@@ -692,18 +919,13 @@ async def assemble_document(
             block_translations,
             output_path,
             source_path,
+            original.metadata,
         )
         if warning and assembly_warnings is not None:
             assembly_warnings.append(warning)
         if not ok:
-            await loop.run_in_executor(
-                None,
-                _assemble_pdf_sync,
-                original.blocks,
-                block_translations,
-                output_path,
-                original.metadata,
-                source_path,
+            raise RuntimeError(
+                "PDF page rebuild failed; reportlab flow fallback is disabled"
             )
 
     else:

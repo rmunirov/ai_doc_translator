@@ -9,6 +9,7 @@ from app.services.pdf_layout_translator import (
     TextBlock,
     clear_blocks,
     draw_translated_block,
+    draw_translated_blocks,
     extract_text_blocks,
     translate_blocks,
     translate_pdf,
@@ -142,3 +143,34 @@ def test_translate_pdf_end_to_end(tmp_path: Path) -> None:
     with fitz.open(str(output_pdf)) as doc:
         text = doc[0].get_text("text")
     assert "ru:Hello PDF" in text
+
+
+def test_draw_translated_blocks_pushes_down_lower_blocks() -> None:
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=300)
+    blocks = [
+        TextBlock(
+            page_index=0,
+            bbox=(20.0, 20.0, 140.0, 45.0),
+            text="Top",
+            size=12.0,
+            color=(0, 0, 0),
+            translated="Очень длинный верхний абзац " * 8,
+            block_type="paragraph",
+        ),
+        TextBlock(
+            page_index=0,
+            bbox=(20.0, 50.0, 140.0, 75.0),
+            text="Bottom",
+            size=12.0,
+            color=(0, 0, 0),
+            translated="Нижний блок",
+            block_type="paragraph",
+        ),
+    ]
+    failed = draw_translated_blocks(doc, blocks)
+    assert failed == 0
+    first = fitz.Rect(blocks[0].bbox)
+    second = fitz.Rect(blocks[1].bbox)
+    assert second.y0 >= first.y1
+    doc.close()

@@ -68,3 +68,33 @@ def overflow_resolution_rate(total_blocks: int, failed_blocks: int) -> float:
     if total_blocks <= 0:
         return 1.0
     return max(0.0, (total_blocks - failed_blocks) / total_blocks)
+
+
+def overlap_count(blocks: list[TextBlock]) -> int:
+    """Count overlapping block pairs on the same page and column."""
+    count = 0
+    for idx, first in enumerate(blocks):
+        for second in blocks[idx + 1 :]:
+            if first.page_index != second.page_index:
+                continue
+            if first.column_id != second.column_id:
+                continue
+            if _bbox_iou(first.bbox, second.bbox) > 0:
+                count += 1
+    return count
+
+
+def reading_order_violations(blocks: list[TextBlock]) -> int:
+    """Count cases where a later block appears above the previous one."""
+    grouped: dict[tuple[int, int], list[TextBlock]] = {}
+    for block in blocks:
+        grouped.setdefault((block.page_index, block.column_id), []).append(block)
+    violations = 0
+    for _, items in grouped.items():
+        prev_top: float | None = None
+        for block in items:
+            current_top = float(block.bbox[1])
+            if prev_top is not None and current_top + 1.0 < prev_top:
+                violations += 1
+            prev_top = current_top
+    return violations

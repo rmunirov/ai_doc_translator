@@ -55,6 +55,36 @@ class ParsedDocument(BaseModel):
     metadata: dict[str, Any] = {}
 
 
+class LayoutBlock(BaseModel):
+    """Layout-aware block used by the PDF rebuild pipeline."""
+
+    block_id: str
+    page: int
+    type: BlockType | str
+    bbox: tuple[float, float, float, float]
+    text: str = ""
+    style: dict[str, Any] = {}
+    reading_order: int = 0
+    column_id: int = 0
+    non_translatable: bool = False
+    table_cells: list[list[str]] | None = None
+
+
+class PageLayout(BaseModel):
+    """Layout container for one page."""
+
+    page: int
+    width: float
+    height: float
+    blocks: list[LayoutBlock]
+
+
+class DocumentLayoutIR(BaseModel):
+    """Document-level layout IR used for translation/rebuild mapping."""
+
+    pages: list[PageLayout]
+
+
 class Chunk(BaseModel):
     """A segment of blocks sized to fit an LLM context window."""
 

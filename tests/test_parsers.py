@@ -161,6 +161,38 @@ async def test_parse_pdf_detects_layout_aware_block_types(tmp_path: Path) -> Non
     assert BlockType.FOOTNOTE in block_types
 
 
+async def test_parse_pdf_merges_wrapped_lines_into_paragraph(tmp_path: Path) -> None:
+    """Wrapped text lines in one column should become one paragraph block."""
+    import pymupdf as fitz
+
+    pdf_path = tmp_path / "wrapped.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=400, height=400)
+    page.insert_text((50, 80), "First wrapped line of paragraph", fontsize=11)
+    page.insert_text((50, 95), "second wrapped line continues", fontsize=11)
+    page.insert_text((50, 110), "third wrapped line ends here.", fontsize=11)
+    doc.save(str(pdf_path))
+    doc.close()
+
+    parser = DocumentParser()
+    result = await parser.parse(str(pdf_path))
+    paragraphs = [b for b in result.blocks if b.type == BlockType.PARAGRAPH]
+    assert paragraphs
+    assert any("third wrapped line ends here." in block.text for block in paragraphs)
+
+
+async def test_parse_pdf_stores_layout_ir_metadata(pdf_file: Path) -> None:
+    """Parser should expose layout_ir metadata with pages and blocks."""
+    parser = DocumentParser()
+    result = await parser.parse(str(pdf_file))
+
+    layout_ir = result.metadata.get("layout_ir")
+    assert isinstance(layout_ir, dict)
+    pages = layout_ir.get("pages", [])
+    assert pages
+    assert isinstance(pages[0].get("blocks", []), list)
+
+
 async def test_parse_unknown_extension_raises(tmp_path: Path) -> None:
     """Unsupported extension raises ValueError."""
     path = tmp_path / "doc.docx"

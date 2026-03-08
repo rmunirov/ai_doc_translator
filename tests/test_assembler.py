@@ -289,7 +289,7 @@ async def test_assemble_pdf_with_images(tmp_path: Path) -> None:
 async def test_assemble_pdf_falls_back_when_no_drawable_bbox(
     tmp_path: Path,
 ) -> None:
-    """When bbox redraw has no blocks, assembler falls back and still translates."""
+    """When no bboxes exist, rebuild should keep source page as-is."""
     source_pdf = tmp_path / "source_no_bbox.pdf"
     output_pdf = tmp_path / "out_fallback.pdf"
 
@@ -315,13 +315,13 @@ async def test_assemble_pdf_falls_back_when_no_drawable_bbox(
     assert output_pdf.exists()
     with fitz.open(str(output_pdf)) as out_doc:
         text = out_doc[0].get_text("text")
-    assert "Translated fallback text" in text
+    assert "Original text" in text
 
 
 async def test_assemble_pdf_falls_back_when_bbox_draw_fails(
     tmp_path: Path,
 ) -> None:
-    """BBox draw failure should trigger reportlab fallback."""
+    """BBox draw failure should keep rebuild output with warning path."""
     source_pdf = tmp_path / "source_draw_fail.pdf"
     output_pdf = tmp_path / "out_draw_fail.pdf"
 
@@ -344,9 +344,7 @@ async def test_assemble_pdf_falls_back_when_bbox_draw_fails(
     with patch(
         "app.services.document_assembler.draw_translated_blocks",
         return_value=1,
-    ), patch(
-        "app.services.document_assembler._assemble_pdf_sync",
-    ) as reportlab_fallback:
+    ):
         await assemble_document(
             parsed,
             [chunk],
@@ -355,7 +353,7 @@ async def test_assemble_pdf_falls_back_when_bbox_draw_fails(
             source_path=str(source_pdf),
         )
 
-    reportlab_fallback.assert_called_once()
+    assert output_pdf.exists()
 
 
 async def test_assemble_pdf_keeps_non_translatable_form_fields(
@@ -411,6 +409,17 @@ async def test_assemble_chunk_mismatch_fallback(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="length mismatch"):
         await assemble_document(parsed, chunks, translated_chunks, output_path)
+
+
+async def test_assemble_pdf_can_rebuild_without_source(tmp_path: Path) -> None:
+    """PDF rebuild should still work when source_path is missing."""
+    blocks = [Block(type=BlockType.PARAGRAPH, text="Hello", page_index=0, bbox=(0, 0, 20, 20))]
+    parsed = ParsedDocument(format="pdf", blocks=blocks)
+    chunk = Chunk(index=0, blocks=blocks, text="Hello")
+    output_path = str(tmp_path / "missing_source.pdf")
+
+    await assemble_document(parsed, [chunk], ["Привет"], output_path, source_path=None)
+    assert Path(output_path).exists()
 
 
 def test_get_block_translations_exact_match() -> None:

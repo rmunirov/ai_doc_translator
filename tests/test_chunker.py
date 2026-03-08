@@ -112,3 +112,21 @@ def test_chunk_pdf_structural_breaks() -> None:
     assert chunks[1].blocks[0].type == BlockType.HEADING
     # Table stays in same chunk as heading (no break before TABLE)
     assert any(b.type == BlockType.TABLE for b in chunks[1].blocks)
+
+
+def test_chunk_pdf_serializes_table_cells_as_structured_text() -> None:
+    """TABLE blocks with table_cells should be serialized as JSON in chunk text."""
+    blocks = [
+        Block(type=BlockType.PARAGRAPH, text="Intro paragraph"),
+        Block(
+            type=BlockType.TABLE,
+            text="A | B\n1 | 2",
+            table_cells=[["A", "B"], ["1", "2"]],
+        ),
+    ]
+    doc = ParsedDocument(format="pdf", blocks=blocks)
+    chunks = chunk_document(doc, chunk_max_tokens_pdf=1200, chunk_min_tokens=10)
+    assert chunks
+    joined = "\n".join(chunk.text for chunk in chunks)
+    assert "\"type\": \"table\"" in joined
+    assert "\"cells\"" in joined

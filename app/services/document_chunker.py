@@ -1,5 +1,7 @@
 """Splits a ParsedDocument into chunks sized for LLM context windows."""
 
+import json
+
 from app.models.schemas import Block, BlockType, Chunk, ParsedDocument
 
 
@@ -82,7 +84,13 @@ def chunk_document(
     overlap_for_next = ""
 
     for block in doc.blocks:
-        block_text = block.text.strip()
+        if block.type == BlockType.TABLE and block.table_cells:
+            block_text = json.dumps(
+                {"type": "table", "cells": block.table_cells},
+                ensure_ascii=False,
+            )
+        else:
+            block_text = block.text.strip()
         block_tokens = _estimate_tokens(block_text)
 
         # Structural break: only before H1/H2, and only if chunk is large enough

@@ -4,14 +4,23 @@ import asyncio
 import io
 import logging
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
 import aiofiles
 import pymupdf
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString
 
-from app.models.schemas import Block, BlockType, ParsedDocument
+from app.models.schemas import (
+    Block,
+    BlockType,
+    DocumentLayoutIR,
+    LayoutBlock,
+    PageLayout,
+    ParsedDocument,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +47,15 @@ _FLAG_BOLD = 16
 # ---------------------------------------------------------------------------
 
 
-def _classify_heading(font_size: float) -> int:
+def _classify_heading(font_size: float, is_bold: bool) -> int:
     """Return heading level (1-3) by font size, or 0 if not a heading."""
-    if font_size >= 18:
+    if not is_bold:
+        return 0
+    if font_size >= 22:
         return 1
-    if font_size >= 14:
+    if font_size >= 18:
         return 2
-    if font_size >= 12:
+    if font_size >= 16:
         return 3
     return 0
 
@@ -135,6 +146,71 @@ def _extract_tag_text_nodes(tag: Tag) -> list[str]:
             if text.strip():
                 nodes.append(text)
     return nodes
+
+
+def _line_gap(block: Block) -> float:
+    """Approximate visual line gap for a block."""
+    if block.bbox is None:
+        return 0.0
+    return float(block.bbox[3] - block.bbox[1])
+
+
+def _merge_page_paragraph_fragments(page_blocks: list[Block]) -> list[Block]:
+    """Merge fragmented paragraph blocks into fuller paragraph units."""
+    if not page_blocks:
+        return page_blocks
+    mids = [
+        (float(block.bbox[0]) + float(block.bbox[2])) / 2
+        for block in page_blocks
+        if block.bbox is not None
+    ]
+    split_x = sorted(mids)[len(mids) // 2] if len(mids) >= 8 else None
+
+    def _column_id(block: Block) -> int:
+        if block.bbox is None or split_x is None:
+            return 0
+        x_mid = (float(block.bbox[0]) + float(block.bbox[2])) / 2
+        return 1 if x_mid > split_x else 0
+
+    merged: list[Block] = []
+    for block in page_blocks:
+        if (
+            merged
+            and block.type == BlockType.PARAGRAPH
+            and merged[-1].type == BlockType.PARAGRAPH
+            and block.bbox is not None
+            and merged[-1].bbox is not None
+        ):
+            prev = merged[-1]
+            assert prev.bbox is not None
+            x_delta = abs(block.bbox[0] - prev.bbox[0])
+            y_gap = block.bbox[1] - prev.bbox[3]
+            gap_limit = max(4.0, min(28.0, max(_line_gap(block), _line_gap(prev)) * 1.1))
+            similar_font = (
+                prev.font_size is None
+                or block.font_size is None
+                or abs(prev.font_size - block.font_size) <= 1.4
+            )
+            same_column = _column_id(block) == _column_id(prev)
+            continuation = not _ends_sentence(prev.text)
+            same_indent = x_delta <= 26.0
+            if (
+                same_column
+                and similar_font
+                and -3.0 <= y_gap <= gap_limit
+                and (same_indent or continuation)
+            ):
+                merged_text = f"{prev.text} {block.text}".strip()
+                merged[-1] = prev.model_copy(
+                    update={
+                        "text": merged_text,
+                        "bbox": _merge_bbox(prev.bbox, block.bbox),
+                        "style_runs": (prev.style_runs or []) + (block.style_runs or []),
+                    }
+                )
+                continue
+        merged.append(block)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -276,12 +352,15 @@ class DocumentParser:
         """Synchronous core of the PDF parser using PyMuPDF."""
         blocks: list[Block] = []
         images_meta: list[dict[str, Any]] = []
+        page_sizes: dict[int, tuple[float, float]] = {}
 
         with pymupdf.open(path) as doc:
             page_count = len(doc)
 
             for page_idx in range(page_count):
                 page = doc[page_idx]
+                page_sizes[page_idx] = (float(page.rect.width), float(page.rect.height))
+                page_blocks_start = len(blocks)
 
                 # 1. Tables
                 table_bboxes: list[tuple[float, float, float, float]] = []
@@ -311,7 +390,7 @@ class DocumentParser:
                                         ]
                                         for row in cells
                                     ],
-                                    non_translatable=True,
+                                    non_translatable=False,
                                 )
                             )
 
@@ -451,7 +530,7 @@ class DocumentParser:
                                 )
                                 continue
 
-                            heading_level = _classify_heading(font_size)
+                            heading_level = _classify_heading(font_size, bold)
                             if heading_level > 0:
                                 flush_paragraph()
                                 blocks.append(
@@ -536,9 +615,53 @@ class DocumentParser:
                             }
                         )
 
+                page_slice = blocks[page_blocks_start:]
+                merged_page = _merge_page_paragraph_fragments(page_slice)
+                blocks[page_blocks_start:] = merged_page
+
+        pages_ir: list[PageLayout] = []
+        for page_idx in range(page_count):
+            page_blocks = [b for b in blocks if b.page_index == page_idx and b.bbox is not None]
+            sorted_blocks = sorted(
+                page_blocks,
+                key=lambda item: (
+                    item.bbox[1] if item.bbox is not None else 0.0,
+                    item.bbox[0] if item.bbox is not None else 0.0,
+                ),
+            )
+            layout_blocks: list[LayoutBlock] = []
+            for order, block in enumerate(sorted_blocks):
+                if block.bbox is None:
+                    continue
+                layout_blocks.append(
+                    LayoutBlock(
+                        block_id=f"blk_{page_idx}_{order}_{uuid.uuid4().hex[:8]}",
+                        page=page_idx,
+                        type=block.type,
+                        bbox=block.bbox,
+                        text=block.text,
+                        style={
+                            "font_size": block.font_size,
+                            "font_color": block.font_color,
+                            "font_name": block.font_name,
+                            "is_bold": block.is_bold,
+                            "line_height": block.line_height,
+                        },
+                        reading_order=order,
+                        column_id=0,
+                        non_translatable=block.non_translatable,
+                        table_cells=block.table_cells,
+                    )
+                )
+            width, height = page_sizes.get(page_idx, (595.0, 842.0))
+            pages_ir.append(
+                PageLayout(page=page_idx, width=width, height=height, blocks=layout_blocks)
+            )
+
         metadata: dict[str, Any] = {
             "page_count": page_count,
             "images": images_meta,
             "source_path": path,
+            "layout_ir": DocumentLayoutIR(pages=pages_ir).model_dump(mode="json"),
         }
         return blocks, metadata

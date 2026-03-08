@@ -4,7 +4,9 @@ from app.models.schemas import Block, BlockType
 from app.services.pdf_layout_translator import TextBlock
 from app.services.quality_metrics import (
     layout_preservation_score,
+    overlap_count,
     overflow_resolution_rate,
+    reading_order_violations,
     style_preservation_rate,
 )
 
@@ -56,3 +58,43 @@ def test_style_preservation_rate_uses_size_bold_and_color() -> None:
 
 def test_overflow_resolution_rate_handles_partial_success() -> None:
     assert overflow_resolution_rate(10, 2) == 0.8
+
+
+def test_overlap_count_counts_same_page_column_overlaps() -> None:
+    blocks = [
+        TextBlock(
+            page_index=0,
+            bbox=(0.0, 0.0, 10.0, 10.0),
+            text="A",
+            color=(0, 0, 0),
+            column_id=0,
+        ),
+        TextBlock(
+            page_index=0,
+            bbox=(5.0, 5.0, 12.0, 12.0),
+            text="B",
+            color=(0, 0, 0),
+            column_id=0,
+        ),
+    ]
+    assert overlap_count(blocks) == 1
+
+
+def test_reading_order_violations_detect_out_of_order_vertical_flow() -> None:
+    blocks = [
+        TextBlock(
+            page_index=0,
+            bbox=(0.0, 40.0, 10.0, 50.0),
+            text="Late",
+            color=(0, 0, 0),
+            column_id=0,
+        ),
+        TextBlock(
+            page_index=0,
+            bbox=(0.0, 10.0, 10.0, 20.0),
+            text="Early",
+            color=(0, 0, 0),
+            column_id=0,
+        ),
+    ]
+    assert reading_order_violations(blocks) == 1
